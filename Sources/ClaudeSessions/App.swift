@@ -243,8 +243,25 @@ struct SessionList: View {
         }
     }
 
+    /// How many sessions each agent has, on purpose not narrowed by the Active toggle or the
+    /// search box.
+    ///
+    // ponytail: these counts also decide whether a pill is disabled. Narrowing them by Active
+    //           made "All" read 1 of 15, and greyed out Codex whenever no Codex session happened
+    //           to be active — stranding you on a filter with no way back to the other agent.
     func count(_ agent: Agent?) -> Int {
-        sessions.filter { (agent == nil || $0.agent == agent) && (!activeOnly || $0.isActive) }.count
+        agent == nil ? sessions.count : sessions.filter { $0.agent == agent }.count
+    }
+
+    /// Says which filter emptied the list, so it never just looks broken.
+    var emptyReason: String {
+        if sessions.isEmpty { return "No sessions yet." }
+        if !query.isEmpty { return searchingInside ? "Searching…" : "Nothing matches “\(query)”." }
+        if activeOnly {
+            return agentFilter.map { "No \($0.label) session is active right now." }
+                ?? "Nothing is active right now."
+        }
+        return agentFilter.map { "No \($0.label) sessions." } ?? "No sessions."
     }
 
     var activeCount: Int {
@@ -296,15 +313,23 @@ struct SessionList: View {
                 // The ones you are still in: running now, or written to within the hour.
                 Button { activeOnly.toggle() } label: {
                     HStack(spacing: 4) {
-                        Circle().fill(.green).frame(width: 5, height: 5)
+                        Circle()
+                            .fill(activeOnly ? AnyShapeStyle(.black.opacity(0.65)) : AnyShapeStyle(.green))
+                            .frame(width: 5, height: 5)
                         Text("Active")
                         Text("\(activeCount)")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(activeOnly ? AnyShapeStyle(.black.opacity(0.55))
+                                                        : AnyShapeStyle(.secondary))
                             .font(.system(size: 10))
                     }
                     .font(.system(size: 11, weight: activeOnly ? .semibold : .regular))
+                    // Filled green when it is on: the one filter that hides rows should be
+                    // obvious at a glance, or an empty list looks like a broken app.
+                    // Dark text, because white on system green is barely legible.
+                    .foregroundStyle(activeOnly ? AnyShapeStyle(.black.opacity(0.85))
+                                                : AnyShapeStyle(.primary))
                     .padding(.horizontal, 9).padding(.vertical, 4)
-                    .background(activeOnly ? AnyShapeStyle(.selection) : AnyShapeStyle(.quaternary),
+                    .background(activeOnly ? AnyShapeStyle(Color.green) : AnyShapeStyle(.quaternary),
                                 in: Capsule())
                     .contentShape(Capsule())
                 }
@@ -317,6 +342,13 @@ struct SessionList: View {
             }
 
             ScrollView {
+                if filtered.isEmpty {
+                    Text(emptyReason)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 28)
+                }
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(filtered) { s in
                         Button { resume(s, skipPermissions: skipPermissions) } label: {
