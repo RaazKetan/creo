@@ -3,8 +3,9 @@ import UserNotifications
 
 /// Tells you when a newer release exists. Nothing is downloaded or installed — Homebrew owns
 /// that — and no information about you is sent. It is one unauthenticated GET for a tag name.
-// ponytail: checked once per launch and cached. A menu bar app that hits the API every time the
-//           panel opens is rude to GitHub and pointless: releases don't appear that often.
+// ponytail: cache checks briefly so repeatedly opening the panel does not hammer GitHub, but do
+//           let the cache expire. Otherwise a release published while the app is running stays
+//           invisible in the panel until the six-hour background check or an app restart.
 enum Update {
     static let repo = "RaazKetan/claude-session-manager"
     static let formula = "raazketan/tap/claude-session-manager"
@@ -32,11 +33,14 @@ enum Update {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
     }
 
-    private static var cached: String??
+    private static var cached: (checkedAt: Date, result: String?)?
+    private static let cacheLifetime: TimeInterval = 60
 
     /// The newer version's tag, or nil when up to date, offline, or running an unreleased build.
     static func newerVersion() async -> String? {
-        if let cached { return cached }
+        if let cached, Date().timeIntervalSince(cached.checkedAt) < cacheLifetime {
+            return cached.result
+        }
 
         guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return nil }
         var request = URLRequest(url: url, timeoutInterval: 5)
@@ -49,7 +53,7 @@ enum Update {
 
         let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
         let result = isNewer(latest, than: current) ? latest : nil
-        cached = result
+        cached = (Date(), result)
         return result
     }
 
