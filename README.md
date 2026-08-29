@@ -35,17 +35,20 @@ brew upgrade --cask claude-sessions                  # installed with the cask
 brew upgrade RaazKetan/tap/claude-session-manager    # built from source
 ```
 
+When the upgrade finishes, the running menu-bar app detects the replacement and reopens the new
+version automatically.
+
 ## What it does
 
 - Lists every Claude Code and Codex session on your Mac, newest first. Filter by agent, or search inside the conversations themselves.
 - Click one to resume it. If it's already open, it jumps to that window instead of starting a second one.
 - Marks the sessions running right now.
 - Starts automatically when you log in.
-- Tells you when an update is out, in the panel and as a notification, and copies the upgrade command for you.
+- Tells you when an update is out, copies the right upgrade command, and reopens itself on the new version when it finishes.
 - Optional checkbox to resume Claude sessions with `--dangerously-skip-permissions`, so they never stop to ask before running a tool. Off unless you turn it on.
 - Sessions whose folder you deleted are greyed out.
-- Right-click a session to move it to the Trash, or reveal the log file in Finder.
-- Reads the logs these tools already keep on your Mac. Nothing about you is sent anywhere. The only network call is one request to GitHub on launch, to see whether a newer version exists.
+- Right-click a session to rename it, move it to the Trash, copy its id, or reveal its log in Finder.
+- Reads the logs these tools already keep on your Mac. Nothing about you is sent anywhere. The only network traffic is an occasional request to GitHub to see whether a newer version exists.
 
 It also installs the [Spotify statusline](https://github.com/RaazKetan/claude-code-spotify) the first time you open it, and backs up your old `statusLine` setting. To skip that, create the file `~/Library/Application Support/ClaudeSessions/statusline-installed` before launching.
 

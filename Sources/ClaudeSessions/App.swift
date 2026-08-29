@@ -486,7 +486,7 @@ struct SessionList: View {
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "arrow.down.circle")
-                        Text(copiedUpgrade ? "Copied — paste it in a terminal"
+                        Text(copiedUpgrade ? "Copied — run it; the app will reopen itself"
                                            : "Version \(newer) is out. Click to copy the upgrade command.")
                         Spacer()
                     }
@@ -556,6 +556,8 @@ struct ClaudeSessionsApp: App {
             Task.detached { latest = await Update.newerVersion(); done.signal() }
             done.wait()
             print("running \(Update.current), \(latest.map { "\($0) is out" } ?? "up to date")")
+            let disk = Update.installedVersion(at: URL(fileURLWithPath: stableBundlePath()))
+            print("installed on disk: \(disk ?? "not an app bundle")")
             print("upgrade with: \(Update.upgradeCommand)")
             print("shell notice: \(Update.noticeFile.path)")
             exit(0)

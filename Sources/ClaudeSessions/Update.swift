@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import UserNotifications
 
 /// Tells you when a newer release exists. Nothing is downloaded or installed — Homebrew owns
@@ -29,9 +30,9 @@ enum Update {
         return "brew upgrade --cask \(cask)"
     }
 
-    static var current: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
-    }
+    // Capture the version this process loaded. The bundle at the same path may be replaced while
+    // we run, but that does not change the Mach-O or version already resident in this process.
+    static let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
 
     private static var cached: (checkedAt: Date, result: String?)?
     private static let cacheLifetime: TimeInterval = 60
@@ -60,6 +61,7 @@ enum Update {
     /// Checks now, then every six hours, and says so once per release — in Notification Center,
     /// and as a line new terminals print, so you hear about it without opening the panel.
     static func watch() {
+        watchForInstalledReplacement()
         Task {
             while true {
                 let newer = await newerVersion()
@@ -72,6 +74,61 @@ enum Update {
                 cached = nil   // so the next round actually asks GitHub again
             }
         }
+    }
+
+    /// Reopens the app when Homebrew (or install.sh) replaces its bundle with a newer version.
+    ///
+    /// A process keeps executing the old Mach-O after the file on disk is replaced, so merely
+    /// finishing `brew upgrade` cannot change the version already in memory. Poll the stable
+    /// bundle location and hand reopening to a tiny helper that waits until this process has
+    /// completely exited. Waiting matters: a plain `open` while this instance is alive only
+    /// activates the old instance instead of launching the new executable.
+    private static func watchForInstalledReplacement() {
+        Task.detached(priority: .utility) {
+            let bundle = URL(fileURLWithPath: stableBundlePath())
+            while true {
+                do { try await Task.sleep(for: .seconds(2)) }
+                catch { return }
+
+                guard let installed = installedVersion(at: bundle),
+                      isNewer(installed, than: current),
+                      scheduleReopen(of: bundle)
+                else { continue }
+                return
+            }
+        }
+    }
+
+    /// Version physically present at a bundle URL, rather than the version cached by Bundle.main.
+    static func installedVersion(at bundle: URL) -> String? {
+        let plist = bundle.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plist),
+              let info = try? PropertyListSerialization.propertyList(from: data, format: nil)
+                as? [String: Any],
+              let version = info["CFBundleShortVersionString"] as? String,
+              let executable = info["CFBundleExecutable"] as? String,
+              FileManager.default.fileExists(
+                atPath: bundle.appendingPathComponent("Contents/MacOS/\(executable)").path)
+        else { return nil }
+        return version
+    }
+
+    /// Starts a helper which waits for this instance to exit, then opens the new bundle.
+    private static func scheduleReopen(of bundle: URL) -> Bool {
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = [
+            "-c",
+            "while kill -0 \"$0\" 2>/dev/null; do sleep 0.1; done; exec /usr/bin/open \"$1\"",
+            "\(ProcessInfo.processInfo.processIdentifier)",
+            bundle.path,
+        ]
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        guard (try? helper.run()) != nil else { return false }
+
+        DispatchQueue.main.async { NSApp.terminate(nil) }
+        return true
     }
 
     // ponytail: UNUserNotificationCenter asks the system for a bundle id and traps without one,

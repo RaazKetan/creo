@@ -1,6 +1,6 @@
 # How it works
 
-Three Swift files, 418 lines. No libraries, no database, no internet.
+Four Swift files, around 1,300 lines. No third-party libraries or database.
 
 ## The big picture
 
@@ -135,9 +135,13 @@ mistake and a loss.
 
 ## Update check
 
-One request to GitHub's releases API on launch, cached for the session. It compares tags
+One request to GitHub's releases API, cached briefly so reopening the panel does not repeat it. It compares tags
 numerically, so 1.10.0 correctly beats 1.9.0. Nothing is downloaded or installed — the app
 shows the `brew upgrade` command and Homebrew stays in charge of the actual update.
+
+The running process checks its bundle on disk every two seconds. When Homebrew or `install.sh`
+replaces that bundle with a newer version, a helper waits for the old process to exit and opens
+the replacement. The menu-bar icon therefore switches versions without a manual quit and restart.
 
 ## What it can't do yet
 
