@@ -178,6 +178,30 @@ func confirmAndTrash(_ s: Session) -> Bool {
     return false
 }
 
+/// Prompts for a custom session name. An empty name restores the title read from the transcript.
+// Like the delete confirmation, this is an NSAlert because selecting a context-menu item closes
+// the menu-bar panel before a SwiftUI sheet can be presented.
+@MainActor
+func promptToRename(_ s: Session) -> Bool {
+    NSApp.activate(ignoringOtherApps: true)
+
+    let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+    field.stringValue = s.name ?? ""
+    field.placeholderString = s.title
+
+    let alert = NSAlert()
+    alert.messageText = "Rename session"
+    alert.informativeText = "Enter a custom name. Leave it empty to use the automatic title."
+    alert.accessoryView = field
+    alert.addButton(withTitle: "Save")
+    alert.addButton(withTitle: "Cancel")
+    alert.window.initialFirstResponder = field
+
+    guard alert.runModal() == .alertFirstButtonReturn else { return false }
+    Names.set(field.stringValue, for: s.sessionID)
+    return true
+}
+
 // MARK: - UI
 
 /// Menu bar mark, as a pixel grid — one row per line, `1` is a filled cell.
@@ -218,6 +242,7 @@ let statusIcon: NSImage = {
 
 struct SessionList: View {
     @State private var sessions: [Session] = []
+    @State private var loadingSessions = true
     @State private var query = ""
     @AppStorage("skipPermissions") private var skipPermissions = false
     @State private var hovered: String?
@@ -255,6 +280,7 @@ struct SessionList: View {
 
     /// Says which filter emptied the list, so it never just looks broken.
     var emptyReason: String {
+        if loadingSessions { return "Loading sessions…" }
         if sessions.isEmpty { return "No sessions yet." }
         if !query.isEmpty { return searchingInside ? "Searching…" : "Nothing matches “\(query)”." }
         if activeOnly {
@@ -414,6 +440,16 @@ struct SessionList: View {
                         .disabled(!s.exists)
                         .onHover { hovered = $0 ? s.id : (hovered == s.id ? nil : hovered) }
                         .contextMenu {
+                            Button("Rename…") {
+                                if promptToRename(s) {
+                                    Task {
+                                        sessions = await Task.detached(priority: .userInitiated) {
+                                            loadSessions()
+                                        }.value
+                                    }
+                                }
+                            }
+                            Divider()
                             Button("Move to Trash…", role: .destructive) {
                                 if confirmAndTrash(s) { sessions = loadSessions() }
                             }
@@ -476,7 +512,14 @@ struct SessionList: View {
         }
         .padding(10)
         .frame(width: 340)
-        .onAppear { sessions = loadSessions() }
+        // Reading transcripts and inspecting live agent processes takes a noticeable fraction
+        // of a second. Keep it off the main actor so clicking the menu-bar icon opens the panel
+        // immediately, then fill in the rows when the scan finishes.
+        .task {
+            loadingSessions = true
+            sessions = await Task.detached(priority: .userInitiated) { loadSessions() }.value
+            loadingSessions = false
+        }
         .task { updateAvailable = await Update.newerVersion() }
     }
 }
