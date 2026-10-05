@@ -146,6 +146,9 @@ final class NotchState: ObservableObject {
     @Published var detailOnLeft = false
     @Published var detailVisible = false
     @Published var expansion: CGFloat = 0
+
+    /// The compact rail, taller while an update button sits under the services.
+    var railHeight: CGFloat { updateVersion == nil ? 160 : 194 }
 }
 
 enum Service: String, CaseIterable {
@@ -211,6 +214,7 @@ private struct UsageBar: View {
 private struct NotchSilhouette: Shape {
     var expansion: CGFloat
     let detailOnLeft: Bool
+    let railHeight: CGFloat
 
     var animatableData: CGFloat {
         get { expansion }
@@ -221,10 +225,11 @@ private struct NotchSilhouette: Shape {
         let progress = min(1, max(0, expansion))
         let right = 54 + 340 * progress
         let left: CGFloat = 40
-        let bottom = 160 + 232 * progress
+        let rail = railHeight
+        let bottom = rail + (392 - rail) * progress
         let topRadius = 18 + 4 * progress
-        let lowerRadius = min(22, min((right - left) / 2, (bottom - 160) / 2))
-        let insideRadius = min(12, (bottom - 160) / 2)
+        let lowerRadius = min(22, min((right - left) / 2, (bottom - rail) / 2))
+        let insideRadius = min(12, (bottom - rail) / 2)
         func point(_ x: CGFloat, _ y: CGFloat) -> CGPoint {
             CGPoint(x: detailOnLeft ? rect.maxX - x : rect.minX + x,
                     y: rect.minY + y)
@@ -240,10 +245,10 @@ private struct NotchSilhouette: Shape {
         path.addQuadCurve(to: point(right - lowerRadius, bottom), control: point(right, bottom))
         path.addLine(to: point(left + lowerRadius, bottom))
         path.addQuadCurve(to: point(left, bottom - lowerRadius), control: point(left, bottom))
-        path.addLine(to: point(left, 160 + insideRadius))
-        path.addQuadCurve(to: point(left - insideRadius, 160), control: point(left, 160))
-        path.addLine(to: point(18, 160))
-        path.addQuadCurve(to: point(0, 142), control: point(0, 160))
+        path.addLine(to: point(left, rail + insideRadius))
+        path.addQuadCurve(to: point(left - insideRadius, rail), control: point(left, rail))
+        path.addLine(to: point(18, rail))
+        path.addQuadCurve(to: point(0, rail - 18), control: point(0, rail))
         path.addLine(to: point(0, 18))
         path.addQuadCurve(to: point(18, 0), control: point(0, 0))
         path.closeSubpath()
@@ -313,21 +318,24 @@ private struct NotchView: View {
             }
         }
         .frame(width: state.selectedService == nil ? 54 : 394,
-               height: state.selectedService == nil ? 160 : 392,
+               height: state.selectedService == nil ? state.railHeight : 392,
                alignment: .topLeading)
         .background {
             NotchSilhouette(expansion: state.expansion,
-                            detailOnLeft: state.detailOnLeft)
+                            detailOnLeft: state.detailOnLeft,
+                            railHeight: state.railHeight)
                 .fill(surface)
                 .overlay {
                     NotchSilhouette(expansion: state.expansion,
-                                    detailOnLeft: state.detailOnLeft)
+                                    detailOnLeft: state.detailOnLeft,
+                                    railHeight: state.railHeight)
                         .stroke(Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.12),
                                 lineWidth: 1)
                 }
         }
         .clipShape(NotchSilhouette(expansion: state.expansion,
-                                   detailOnLeft: state.detailOnLeft))
+                                   detailOnLeft: state.detailOnLeft,
+                                   railHeight: state.railHeight))
         .frame(maxWidth: .infinity, maxHeight: .infinity,
                alignment: state.detailOnLeft ? .topTrailing : .topLeading)
         .task(id: state.refreshToken) {
@@ -353,17 +361,7 @@ private struct NotchView: View {
                     .font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if let version = state.updateVersion {
-                    Button {
-                        guard !state.isUpdating else { return }
-                        state.isUpdating = true
-                        state.updateFailure = nil
-                        Task {
-                            if let failure = await Update.install(version) {
-                                state.isUpdating = false
-                                state.updateFailure = failure
-                            }
-                        }
-                    } label: {
+                    Button { startUpdate(version) } label: {
                         HStack(spacing: 4) {
                             Image(systemName: state.isUpdating
                                   ? "arrow.triangle.2.circlepath" : "arrow.down.circle.fill")
@@ -494,10 +492,37 @@ private struct NotchView: View {
         .frame(width: 340, height: 392)
     }
 
+    private func startUpdate(_ version: String) {
+        guard !state.isUpdating else { return }
+        state.isUpdating = true
+        state.updateFailure = nil
+        Task {
+            if let failure = await Update.install(version) {
+                state.isUpdating = false
+                state.updateFailure = failure
+            }
+        }
+    }
+
     private var serviceRail: some View {
         VStack(spacing: 6) {
             ForEach(Service.allCases, id: \.self) { service in
                 serviceButton(service)
+            }
+            if let version = state.updateVersion {
+                Button { startUpdate(version) } label: {
+                    Image(systemName: state.isUpdating ? "arrow.triangle.2.circlepath"
+                          : "arrow.down.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(state.updateFailure == nil ? .green : .orange)
+                        .frame(width: 42, height: 26)
+                        .background(Color.primary.opacity(0.07), in: Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(state.isUpdating)
+                .help(state.updateFailure ?? "Update to Creo \(version)")
+                .accessibilityLabel("Update to Creo \(version)")
             }
         }
         .padding(.horizontal, 6)
@@ -731,6 +756,9 @@ final class NotchController {
         panel.setFrame(target, display: false)
         panel.alphaValue = 0
         state.refreshToken += 1
+        // Ask again on every open (cached for a minute), so a release published while the app
+        // was running shows up now instead of at the next six-hour check.
+        Task { if let newer = await Update.newerVersion() { showUpdate(newer) } }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         NSAnimationContext.runAnimationGroup { context in
@@ -789,6 +817,10 @@ final class NotchController {
     func showUpdate(_ version: String) {
         guard state.updateVersion != version else { return }
         state.updateVersion = version
+        // The rail just grew; resize a visible compact panel to fit the button.
+        if let panel, panel.isVisible, !targetExpanded, let screen = panel.screen ?? NSScreen.main {
+            position(on: screen)
+        }
     }
 
     private func dismissIfClickIsOutside() {
@@ -902,7 +934,7 @@ final class NotchController {
 
     private func frame(on screen: NSScreen, expanded: Bool) -> NSRect {
         let width: CGFloat = expanded ? 394 : 54
-        let height: CGFloat = expanded ? 392 : 160
+        let height: CGFloat = expanded ? 392 : state.railHeight
         let dockX = dockOrigin(on: screen)
         let preferredX = expanded && state.detailOnLeft ? dockX - 340 : dockX
         let x = min(max(preferredX, screen.visibleFrame.minX + 8),
