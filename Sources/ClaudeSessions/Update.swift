@@ -2,8 +2,8 @@ import Foundation
 import AppKit
 import UserNotifications
 
-/// Tells you when a newer release exists. Nothing is downloaded or installed — Homebrew owns
-/// that — and no information about you is sent. It is one unauthenticated GET for a tag name.
+/// Tells you when a newer release exists and lets Homebrew install it in the background.
+/// No information about you is sent; the check is one unauthenticated GET for a tag name.
 // ponytail: cache checks briefly so repeatedly opening the panel does not hammer GitHub, but do
 //           let the cache expire. Otherwise a release published while the app is running stays
 //           invisible in the panel until the six-hour background check or an app restart.
@@ -12,22 +12,88 @@ enum Update {
     static let formula = "raazketan/tap/creo"
     static let cask = "creo"
 
-    /// The single command that updates *this* copy.
-    ///
-    /// Three ways in, three commands out: the cask drops the prebuilt app in /Applications, the
-    /// formula builds from source under Homebrew's prefix, and install.sh copies to /Applications
-    /// with Homebrew knowing nothing about it.
-    ///
-    // ponytail: the app can see where it is standing, so it never has to guess. This was one
-    //           hard-coded cask upgrade for everybody, which answered "Cask 'creo' is
-    //           not installed" for anyone who took the build-from-source route.
-    static var upgradeCommand: String {
-        guard Bundle.main.bundleURL.path.hasPrefix("/Applications/") else { return "brew upgrade \(formula)" }
+    private enum Installation: String {
+        case cask, formula, unmanaged
+    }
+
+    private static var brewExecutable: String? {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private static var installation: Installation {
+        guard Bundle.main.bundleURL.path.hasPrefix("/Applications/") else { return .formula }
         let caskroom = ["/opt/homebrew", "/usr/local"].map { "\($0)/Caskroom/\(cask)" }
-        guard caskroom.contains(where: { FileManager.default.fileExists(atPath: $0) }) else {
-            return "curl -fsSL https://raw.githubusercontent.com/\(repo)/main/install.sh | zsh"
+        return caskroom.contains(where: FileManager.default.fileExists(atPath:)) ? .cask : .unmanaged
+    }
+
+    /// The command used internally by the one-click updater, also printed by `creo --update`.
+    static var upgradeCommand: String {
+        switch installation {
+        case .cask: "brew upgrade --cask \(formula)"
+        case .formula: "brew upgrade --formula \(formula)"
+        case .unmanaged: "brew install --cask --force \(formula)"
         }
-        return "brew upgrade --cask \(cask)"
+    }
+
+    /// Runs the update without opening Terminal or copying a command. On success the helper
+    /// closes this process and reopens the newly installed app. A manually installed copy is
+    /// adopted by replacing it with the cask, so all future updates use the normal cask route.
+    static func install(_ version: String) async -> String? {
+        guard let brew = brewExecutable else {
+            return "Homebrew is required for automatic updates. Install it, then try again."
+        }
+
+        let log = FileManager.default.temporaryDirectory
+            .appendingPathComponent("creo-update.log")
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = [
+            "-c",
+            """
+            brew="$0"; pid="$1"; bundle="$2"; mode="$3"; log="$4"; expected="$5"
+            "$brew" update >"$log" 2>&1 || exit $?
+            case "$mode" in
+              cask) "$brew" upgrade --cask raazketan/tap/creo >>"$log" 2>&1 ;;
+              formula) "$brew" upgrade --formula raazketan/tap/creo >>"$log" 2>&1 ;;
+              unmanaged) "$brew" install --cask --force raazketan/tap/creo >>"$log" 2>&1 ;;
+            esac
+            status=$?
+            [ "$status" -eq 0 ] || exit "$status"
+            installed=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+              "$bundle/Contents/Info.plist" 2>>"$log")
+            if [ "$installed" != "$expected" ]; then
+              echo "Homebrew has $installed, but Creo $expected is not in the tap yet." >>"$log"
+              exit 65
+            fi
+            kill -TERM "$pid" 2>/dev/null || true
+            while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+            /usr/bin/open "$bundle"
+            """,
+            brew,
+            "\(ProcessInfo.processInfo.processIdentifier)",
+            stableBundlePath(),
+            installation.rawValue,
+            log.path,
+            version,
+        ]
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+
+        return await withCheckedContinuation { continuation in
+            helper.terminationHandler = { process in
+                guard process.terminationStatus != 0 else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let output = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+                let detail = output.split(separator: "\n").last.map(String.init)
+                    ?? "Homebrew could not install the update."
+                continuation.resume(returning: "\(detail) See \(log.path)")
+            }
+            do { try helper.run() }
+            catch { continuation.resume(returning: "Could not start Homebrew: \(error.localizedDescription)") }
+        }
     }
 
     // Capture the version this process loaded. The bundle at the same path may be replaced while
@@ -143,7 +209,7 @@ enum Update {
             guard granted else { return }
             let content = UNMutableNotificationContent()
             content.title = "Creo \(version) is out"
-            content.body = upgradeCommand
+            content.body = "Open Creo and click Update to install it automatically."
             center.add(UNNotificationRequest(identifier: "update-\(version)", content: content, trigger: nil))
         }
     }
@@ -156,7 +222,7 @@ enum Update {
 
     private static func writeShellNotice(_ version: String?) {
         guard let version else { try? FileManager.default.removeItem(at: noticeFile); return }
-        let line = "[creo] \(version) is out (you have \(current)) — \(upgradeCommand)\n"
+        let line = "[creo] \(version) is out (you have \(current)) — open Creo and click Update.\n"
         try? FileManager.default.createDirectory(at: noticeFile.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         try? line.write(to: noticeFile, atomically: true, encoding: .utf8)

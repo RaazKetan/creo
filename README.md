@@ -29,8 +29,8 @@ open "$(brew --prefix)/opt/creo/Creo.app"
 brew upgrade --cask RaazKetan/tap/creo
 ```
 
-Creo checks for new releases, shows an update notice, and reopens itself after
-the new version is installed.
+Creo checks for new releases. Click **Update** in the app to install the new
+version through Homebrew automatically; Creo then reopens itself.
 
 ## Features
 

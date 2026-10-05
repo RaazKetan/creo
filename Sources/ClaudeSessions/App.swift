@@ -256,7 +256,8 @@ struct SessionList: View {
     @State private var insideMatches: [String: String] = [:]   // session id -> the passage that matched
     @State private var searchingInside = false
     @State private var updateAvailable: String?
-    @State private var copiedUpgrade = false
+    @State private var updating = false
+    @State private var updateFailure: String?
     @AppStorage("agentFilterRaw") private var agentFilterRaw = ""
     @AppStorage("activeOnly") private var activeOnly = false
     private var agentFilter: Agent? {
@@ -487,14 +488,21 @@ struct SessionList: View {
 
             if let newer = updateAvailable {
                 Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(Update.upgradeCommand, forType: .string)
-                    copiedUpgrade = true
+                    guard !updating else { return }
+                    updating = true
+                    updateFailure = nil
+                    Task {
+                        if let failure = await Update.install(newer) {
+                            updating = false
+                            updateFailure = failure
+                        }
+                    }
                 } label: {
                     HStack(spacing: 5) {
-                        Image(systemName: "arrow.down.circle")
-                        Text(copiedUpgrade ? "Copied — run it; the app will reopen itself"
-                                           : "Version \(newer) is out. Click to copy the upgrade command.")
+                        Image(systemName: updating ? "arrow.triangle.2.circlepath" : "arrow.down.circle")
+                        Text(updating ? "Updating Creo…"
+                             : updateFailure == nil ? "Update to version \(newer)"
+                             : "Update failed — click to retry")
                         Spacer()
                     }
                     .font(.caption)
@@ -504,7 +512,8 @@ struct SessionList: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(Update.upgradeCommand)
+                .disabled(updating)
+                .help(updateFailure ?? "Install the update automatically and reopen Creo")
             }
 
             HStack {

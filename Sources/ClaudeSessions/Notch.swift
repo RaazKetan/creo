@@ -86,7 +86,8 @@ struct CodexUsage {
 final class NotchState: ObservableObject {
     @Published var usage: CodexUsage?
     @Published var updateVersion: String?
-    @Published var copied = false
+    @Published var isUpdating = false
+    @Published var updateFailure: String?
     @Published var refreshToken = 0
     @Published var selectedService: Service?
     @Published var detailOnLeft = false
@@ -297,27 +298,32 @@ private struct NotchView: View {
                 Spacer()
                 if let version = state.updateVersion {
                     Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(Update.upgradeCommand, forType: .string)
-                        withAnimation(.easeInOut(duration: 0.18)) { state.copied = true }
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .seconds(1.8))
-                            withAnimation(.easeInOut(duration: 0.18)) { state.copied = false }
+                        guard !state.isUpdating else { return }
+                        state.isUpdating = true
+                        state.updateFailure = nil
+                        Task {
+                            if let failure = await Update.install(version) {
+                                state.isUpdating = false
+                                state.updateFailure = failure
+                            }
                         }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: state.copied ? "checkmark.circle.fill" : "arrow.down.circle.fill")
-                            Text(state.copied ? "Command copied" : "Update \(version)")
+                            Image(systemName: state.isUpdating
+                                  ? "arrow.triangle.2.circlepath" : "arrow.down.circle.fill")
+                            Text(state.isUpdating ? "Updating…"
+                                 : state.updateFailure == nil ? "Update \(version)" : "Retry update")
                         }
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(state.copied ? Color.primary.opacity(0.7) : .green)
+                        .foregroundStyle(state.updateFailure == nil ? .green : .orange)
                         .padding(.horizontal, 7)
                         .frame(height: 24)
                         .background(Color.primary.opacity(0.07), in: Capsule())
                         .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
-                    .help("Copy: \(Update.upgradeCommand)")
+                    .disabled(state.isUpdating)
+                    .help(state.updateFailure ?? "Install the update automatically and reopen Creo")
                 }
                 Button(action: close) {
                     Image(systemName: "xmark")
