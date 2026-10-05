@@ -14,6 +14,17 @@ struct UsageWindow {
         resetsAt = Date(timeIntervalSince1970: reset)
     }
 
+    /// Claude's shape: `{"utilization": 17.0, "resets_at": "2026-10-07T12:59:59.75+00:00"}`.
+    init?(claude value: [String: Any]?) {
+        guard let value, let used = value["utilization"] as? Double,
+              let stamp = value["resets_at"] as? String else { return nil }
+        // Fractional seconds are optional, so drop them rather than juggle two formatters.
+        let whole = stamp.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
+        guard let reset = ISO8601DateFormatter().date(from: whole) else { return nil }
+        remaining = max(0, min(100, Int((100 - used).rounded())))
+        resetsAt = reset
+    }
+
     var tint: Color {
         if remaining < 20 { return .red }
         if remaining <= 50 { return Color(red: 1.0, green: 0.62, blue: 0.08) }
@@ -21,11 +32,17 @@ struct UsageWindow {
     }
 }
 
-struct CodexUsage {
+struct PlanUsage {
     let fiveHour: UsageWindow?
     let weekly: UsageWindow?
 
-    init?(_ result: [String: Any]) {
+    init?(fiveHour: UsageWindow?, weekly: UsageWindow?) {
+        guard fiveHour != nil || weekly != nil else { return nil }
+        self.fiveHour = fiveHour
+        self.weekly = weekly
+    }
+
+    init?(codex result: [String: Any]) {
         guard let limits = result["rateLimits"] as? [String: Any] else { return nil }
         fiveHour = UsageWindow(limits["primary"] as? [String: Any])
         weekly = UsageWindow(limits["secondary"] as? [String: Any])
@@ -34,7 +51,7 @@ struct CodexUsage {
 
     /// Ask the user's signed-in Codex CLI for the same plan windows it displays itself.
     /// The child process reads its own credentials; this app never opens or stores them.
-    static func read() -> CodexUsage? {
+    static func readCodex() -> PlanUsage? {
         let paths = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"]
             + (ProcessInfo.processInfo.environment["PATH"] ?? "")
                 .split(separator: ":").map { "\($0)/codex" }
@@ -75,16 +92,52 @@ struct CodexUsage {
                 pending.removeSubrange(...newline)
                 guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
                       (object["id"] as? Int) == 2 else { continue }
-                return (object["result"] as? [String: Any]).flatMap(CodexUsage.init)
+                return (object["result"] as? [String: Any]).flatMap { PlanUsage(codex: $0) }
             }
         }
         return nil
+    }
+
+    /// The same windows Claude Code's `/usage` shows. Claude Code keeps its sign-in in the
+    /// Keychain; `security` is already trusted to read that item, so there is no prompt.
+    /// The token is used for this one request and never stored.
+    static func readClaude() async -> PlanUsage? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        var secret = Data()
+        if (try? process.run()) != nil {
+            secret = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+        }
+        if secret.isEmpty {   // older installs keep it in a file instead
+            secret = (try? Data(contentsOf: FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude/.credentials.json"))) ?? Data()
+        }
+        guard let credentials = (try? JSONSerialization.jsonObject(with: secret)) as? [String: Any],
+              let oauth = credentials["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String else { return nil }
+
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!,
+                                 timeoutInterval: 10)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        // ponytail: an expired token just reads as unavailable; Claude Code refreshes it next run.
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return nil }
+        return PlanUsage(fiveHour: UsageWindow(claude: body["five_hour"] as? [String: Any]),
+                         weekly: UsageWindow(claude: body["seven_day"] as? [String: Any]))
     }
 }
 
 @MainActor
 final class NotchState: ObservableObject {
-    @Published var usage: CodexUsage?
+    @Published var usage: [Service: PlanUsage] = [:]
     @Published var updateVersion: String?
     @Published var isUpdating = false
     @Published var updateFailure: String?
@@ -97,6 +150,9 @@ final class NotchState: ObservableObject {
 
 enum Service: String, CaseIterable {
     case chatgpt, claude, perplexity
+
+    /// Services whose plan usage Creo can read locally.
+    static let tracked: [Service] = [.chatgpt, .claude]
 
     var title: String {
         switch self {
@@ -232,12 +288,12 @@ private struct NotchView: View {
     }
 
     private func usageHint(_ service: Service) -> String {
-        guard service == .chatgpt else { return "\(service.title) usage opens in your account" }
+        guard Service.tracked.contains(service) else { return "\(service.title) usage opens in your account" }
         let windows: [String] = [
-            state.usage?.fiveHour.map { "\($0.remaining)% 5h remaining" },
-            state.usage?.weekly.map { "\($0.remaining)% weekly remaining" },
+            state.usage[service]?.fiveHour.map { "\($0.remaining)% 5h remaining" },
+            state.usage[service]?.weekly.map { "\($0.remaining)% weekly remaining" },
         ].compactMap { $0 }
-        return windows.isEmpty ? "ChatGPT usage unavailable" : windows.joined(separator: ", ")
+        return windows.isEmpty ? "\(service.title) usage unavailable" : windows.joined(separator: ", ")
     }
 
     var body: some View {
@@ -456,7 +512,7 @@ private struct NotchView: View {
                     Color.primary.opacity(state.selectedService == service ? 0.32 : 0.16),
                     lineWidth: 2
                 )
-                if service == .chatgpt, let usage = state.usage {
+                if let usage = state.usage[service] {
                     usageRings(usage)
                 }
                 Image(nsImage: service.mark)
@@ -470,8 +526,8 @@ private struct NotchView: View {
             .contentShape(Circle())
             .scaleEffect(state.selectedService == service ? 1.04 : 1)
             .animation(.easeOut(duration: 0.18), value: state.selectedService)
-            .animation(.easeOut(duration: 0.32), value: state.usage?.fiveHour?.remaining)
-            .animation(.easeOut(duration: 0.32), value: state.usage?.weekly?.remaining)
+            .animation(.easeOut(duration: 0.32), value: state.usage[service]?.fiveHour?.remaining)
+            .animation(.easeOut(duration: 0.32), value: state.usage[service]?.weekly?.remaining)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(service.title), \(count(service)) sessions, \(usageHint(service))")
@@ -479,7 +535,7 @@ private struct NotchView: View {
     }
 
     @ViewBuilder
-    private func usageRings(_ usage: CodexUsage) -> some View {
+    private func usageRings(_ usage: PlanUsage) -> some View {
         // The short allowance is the primary signal, so it owns the larger,
         // easier-to-read outer ring. The longer weekly allowance sits inside.
         if let fiveHour = usage.fiveHour {
@@ -502,7 +558,7 @@ private struct NotchView: View {
                 Text("Usage remaining")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                if selected == .chatgpt {
+                if Service.tracked.contains(selected) {
                     Button {
                         NotchController.shared.refreshUsage()
                     } label: { Image(systemName: "arrow.clockwise") }
@@ -510,24 +566,20 @@ private struct NotchView: View {
                         .help("Refresh usage")
                 }
             }
-            if selected == .chatgpt {
-                if let window = state.usage?.fiveHour { UsageBar(title: "5h", window: window) }
-                if let window = state.usage?.weekly { UsageBar(title: "Weekly", window: window) }
-                if state.usage == nil {
-                    Text("Sign in to Codex to see usage here.")
+            if Service.tracked.contains(selected) {
+                if let window = state.usage[selected]?.fiveHour { UsageBar(title: "5h", window: window) }
+                if let window = state.usage[selected]?.weekly { UsageBar(title: "Weekly", window: window) }
+                if state.usage[selected] == nil {
+                    Text("Sign in to \(selected == .claude ? "Claude Code" : "Codex") to see usage here.")
                         .font(.system(size: 11))
                         .foregroundStyle(Color.primary.opacity(0.6))
                 }
             } else {
-                Text(selected == .claude
-                     ? "Claude usage is available in your account dashboard."
-                     : "Perplexity usage is available in your account.")
+                Text("Perplexity usage is available in your account.")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.primary.opacity(0.6))
                 Link("Open \(selected.title) usage ↗", destination:
-                        URL(string: selected == .claude
-                            ? "https://claude.ai/settings/usage"
-                            : "https://www.perplexity.ai/settings/account")!)
+                        URL(string: "https://www.perplexity.ai/settings/account")!)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.green)
             }
@@ -630,7 +682,6 @@ final class NotchController {
     private var animationID = 0
     private var isHiding = false
     private var targetExpanded = false
-    private var usagePulseTimer: Timer?
 
     func start() {
         guard panel == nil, let screen = statusButton?.window?.screen ?? NSScreen.main else { return }
@@ -818,63 +869,30 @@ final class NotchController {
 
     func refreshUsage() {
         Task.detached(priority: .utility) {
-            let value = CodexUsage.read()
-            if let value {
-                await MainActor.run {
-                    self.state.usage = value
-                    self.updateUsagePulse()
-                }
+            async let codex = PlanUsage.readCodex()
+            async let claude = PlanUsage.readClaude()
+            let results: [(Service, PlanUsage?)] = [(.chatgpt, await codex), (.claude, await claude)]
+            await MainActor.run {
+                // A failed read keeps the last good value instead of blanking the ring.
+                for case let (service, usage?) in results { self.state.usage[service] = usage }
+                self.updateStatusIcon()
             }
         }
     }
 
-    private func updateUsagePulse() {
-        let windows: [(String, UsageWindow?)] = [
-            ("5h", state.usage?.fiveHour), ("Weekly", state.usage?.weekly)
-        ]
-        let critical = windows.compactMap { name, window -> String? in
-            guard let window, window.remaining < 20, window.resetsAt > Date() else { return nil }
-            return "\(name) \(window.remaining)% remaining"
-        }
-        if critical.isEmpty {
-            usagePulseTimer?.invalidate()
-            usagePulseTimer = nil
-            statusButton?.contentTintColor = nil
-        } else if usagePulseTimer == nil {
-            usagePulseTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) {
-                [weak self] _ in
-                Task { @MainActor [weak self] in self?.updatePulseFrame() }
-            }
-        }
-        updateStatusIcon(criticalUsage: critical)
-    }
-
-    private func updatePulseFrame() {
-        guard let usage = state.usage,
-              [usage.fiveHour, usage.weekly].contains(where: {
-                  guard let window = $0 else { return false }
-                  return window.remaining < 20 && window.resetsAt > Date()
-              }) else {
-            updateUsagePulse()
-            return
-        }
-        let phase = Date().timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 2.8)
-        let amount = phase < 0.9 ? pow(sin(.pi * phase / 0.9), 2) : 0
-        statusButton?.contentTintColor = amount > 0.01
-            ? NSColor.labelColor.blended(withFraction: amount, of: .systemRed)
-            : nil
-    }
-
-    private func updateStatusIcon(criticalUsage: [String]? = nil) {
+    /// A steady red icon while any plan is under 20%. It used to pulse, which read as flicker.
+    private func updateStatusIcon() {
         guard let button = statusButton else { return }
         button.image = statusIcon
         button.imageScaling = .scaleProportionallyDown
-        let critical = criticalUsage ?? [
-            ("5h", state.usage?.fiveHour), ("Weekly", state.usage?.weekly)
-        ].compactMap { name, window -> String? in
-            guard let window, window.remaining < 20, window.resetsAt > Date() else { return nil }
-            return "\(name) \(window.remaining)% remaining"
+        let critical = Service.tracked.flatMap { service in
+            [("5h", state.usage[service]?.fiveHour), ("Weekly", state.usage[service]?.weekly)]
+                .compactMap { name, window -> String? in
+                    guard let window, window.remaining < 20, window.resetsAt > Date() else { return nil }
+                    return "\(service.title) \(name) \(window.remaining)% remaining"
+                }
         }
+        button.contentTintColor = critical.isEmpty ? nil : .systemRed
         button.toolTip = (["Creo — sessions and usage"] + critical).joined(separator: " · ")
     }
 

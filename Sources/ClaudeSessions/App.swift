@@ -567,15 +567,19 @@ struct CreoApp: App {
             exit(0)
         }
         if CommandLine.arguments.contains("--usage") {
-            if let usage = CodexUsage.read() {
-                for (name, window) in [("5h", usage.fiveHour), ("Weekly", usage.weekly)] {
-                    if let window {
-                        print("\(name): \(window.remaining)% remaining, resets \(window.resetsAt.formatted())")
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                for (title, usage) in [("Codex", PlanUsage.readCodex()), ("Claude", await PlanUsage.readClaude())] {
+                    guard let usage else { print("\(title) usage unavailable"); continue }
+                    for (name, window) in [("5h", usage.fiveHour), ("Weekly", usage.weekly)] {
+                        if let window {
+                            print("\(title) \(name): \(window.remaining)% remaining, resets \(window.resetsAt.formatted())")
+                        }
                     }
                 }
-            } else {
-                print("Codex usage unavailable")
+                semaphore.signal()
             }
+            semaphore.wait()
             exit(0)
         }
         // runnable check: `swift run creo --update`
