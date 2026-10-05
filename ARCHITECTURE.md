@@ -1,6 +1,6 @@
 # How it works
 
-Four Swift files, around 1,300 lines. No third-party libraries or database.
+The app is built in Swift without third-party libraries or a database.
 
 ## The big picture
 
@@ -11,7 +11,7 @@ gives you a way back into them.
 flowchart LR
     CC["Claude Code"] -->|writes logs| L[("~/.claude/projects")]
     CX["Codex"] -->|writes logs| L2[("~/.codex/sessions")]
-    L -->|reads| APP["Claude Sessions<br/>menu bar app"]
+    L -->|reads| APP["Creo<br/>menu bar app"]
     L2 -->|reads| APP
     APP -->|"opens a terminal<br/>or jumps to one"| T["Your terminal"]
     T --> CC
@@ -27,12 +27,10 @@ row and it moves that transcript to the Trash, where you can put it back.
 flowchart TD
     subgraph yours["Files Claude Code owns"]
         A["~/.claude/projects/&lt;project&gt;/&lt;session&gt;.jsonl<br/>one file per conversation"]
-        B["~/.claude/settings.json<br/>your statusline setting"]
     end
     subgraph ours["Files this app owns"]
         C["names.json<br/>your custom session names"]
-        D["statusline-installed<br/>marker, so setup runs once"]
-        E["dev.local.claudesessions.plist<br/>starts the app at login"]
+        E["io.github.raazketan.creo.plist<br/>starts the app at login"]
     end
 ```
 
@@ -102,12 +100,15 @@ upgrade, so it points at Homebrew's fixed shortcut instead.
 flowchart LR
     A["git tag v1.6.0"] --> B["GitHub builds the app"]
     B --> C["Attaches a download<br/>to the release"]
-    C --> D["The tap updates itself"]
-    D --> E["brew install<br/>gets the new version"]
+    C --> D["Release summary gives<br/>the two tap checksums"]
+    D --> E["Maintainer updates<br/>the Homebrew tap"]
+    E --> F["brew install<br/>gets the new version"]
 ```
 
-Pushing a tag is the whole release process. The build works on both Intel and Apple Silicon
-Macs, and the build fails on purpose if the Intel half is missing.
+Pushing a tag builds and publishes the release. Copy the formula and cask checksums from that
+workflow's summary into `RaazKetan/homebrew-tap`; after that, both install routes receive the new
+version. The build works on both Intel and Apple Silicon Macs, and fails on purpose if the Intel
+half is missing.
 
 ## Two ways to install, and why
 
@@ -155,7 +156,7 @@ the replacement. The menu-bar icon therefore switches versions without a manual 
 ## Checking it works
 
 ```sh
-swift run ClaudeSessions --list
+swift run creo --list
 ```
 
 Prints every session it can read, with no window. A `!` at the start of a line means that

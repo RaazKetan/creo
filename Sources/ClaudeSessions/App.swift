@@ -2,8 +2,8 @@ import SwiftUI
 import ServiceManagement
 
 /// Brings an already-running session forward, or starts it in the default terminal.
-// ponytail: skipPermissions is opt-in and off by default. It hands the session blanket
-//           tool approval, which is the user's call to make, not an install-time default.
+// ponytail: skipPermissions is opt-in and off by default. Claude bypasses its
+//           permission prompts; Codex skips approval prompts but keeps its sandbox.
 func resume(_ s: Session, skipPermissions: Bool = false) {
     if focusRunningSession(s) { return }
 
@@ -73,7 +73,7 @@ private func tty(ofPID pid: String) -> String? {
 }
 
 /// Bundle path with any Homebrew version baked out of it:
-/// …/Cellar/claude-session-manager/1.3.1/X.app → …/opt/claude-session-manager/X.app
+/// …/Cellar/creo/1.3.1/Creo.app → …/opt/creo/Creo.app
 func stableBundlePath() -> String {
     let path = Bundle.main.bundleURL.path
     guard let range = path.range(of: "/Cellar/[^/]+/[^/]+/", options: .regularExpression) else { return path }
@@ -91,14 +91,15 @@ func enableLaunchAtLogin() {
     let agents = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/LaunchAgents")
     let plist: [String: Any] = [
-        "Label": "dev.local.claudesessions",
-        "ProgramArguments": ["\(stableBundlePath())/Contents/MacOS/ClaudeSessions"],
+        "Label": "io.github.raazketan.creo",
+        "ProgramArguments": ["\(stableBundlePath())/Contents/MacOS/creo"],
         "RunAtLoad": true,
     ]
     guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
     else { return }
     try? FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
-    try? data.write(to: agents.appendingPathComponent("dev.local.claudesessions.plist"), options: .atomic)
+    try? data.write(to: agents.appendingPathComponent("io.github.raazketan.creo.plist"), options: .atomic)
+    try? FileManager.default.removeItem(at: agents.appendingPathComponent("dev.local.claudesessions.plist"))
 }
 
 /// Focuses the window already running this session.
@@ -204,36 +205,42 @@ func promptToRename(_ s: Session) -> Bool {
 
 // MARK: - UI
 
-/// Menu bar mark, as a pixel grid — one row per line, `1` is a filled cell.
-private let iconPixels = [
-    "0011111111111100",
-    "0011111111111100",
-    "0011011111101100",
-    "0011011111101100",
-    "1111111111111111",
-    "1111111111111111",
-    "0011111111111100",
-    "0011111111111100",
-    "0001010000101000",
-    "0001010000101000",
-]
+private func puzzlePiece(_ rect: NSRect, radius: CGFloat) -> NSBezierPath {
+    NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+}
 
-// ponytail: 1.5pt cells land on whole device pixels at 2x, so the sprite stays crisp
-//           instead of smearing the way a scaled bitmap would.
+/// Creo's four-piece mark, redrawn as paths so the menu-bar version stays crisp.
+private func drawCreoMark(in bounds: NSRect) {
+    let unit = min(bounds.width, bounds.height)
+    let x = bounds.midX - unit / 2, y = bounds.midY - unit / 2
+    let r = unit * 0.10
+    let pieces = [
+        puzzlePiece(NSRect(x: x + unit * 0.46, y: y + unit * 0.51,
+                           width: unit * 0.44, height: unit * 0.41), radius: r),
+        puzzlePiece(NSRect(x: x + unit * 0.10, y: y + unit * 0.09,
+                           width: unit * 0.42, height: unit * 0.42), radius: r),
+        puzzlePiece(NSRect(x: x + unit * 0.28, y: y + unit * 0.54,
+                           width: unit * 0.18, height: unit * 0.18), radius: unit * 0.07),
+        puzzlePiece(NSRect(x: x + unit * 0.53, y: y + unit * 0.27,
+                           width: unit * 0.20, height: unit * 0.23), radius: unit * 0.07),
+    ]
+    NSColor.black.setFill()
+    pieces.forEach { $0.fill() }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current?.compositingOperation = .clear
+    [NSPoint(x: x + unit * 0.68, y: y + unit * 0.92),
+     NSPoint(x: x + unit * 0.10, y: y + unit * 0.30),
+     NSPoint(x: x + unit * 0.63, y: y + unit * 0.27)].forEach { center in
+        let radius = unit * 0.052
+        NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius,
+                                    width: radius * 2, height: radius * 2)).fill()
+    }
+    NSGraphicsContext.restoreGraphicsState()
+}
+
 let statusIcon: NSImage = {
-    let cell: CGFloat = 1.25
-    let cols = CGFloat(iconPixels[0].count), rows = CGFloat(iconPixels.count)
-
-    let icon = NSImage(size: NSSize(width: cols * cell, height: rows * cell), flipped: false) { _ in
-        NSColor.black.setFill()   // template images are an alpha mask; macOS supplies the colour
-        for (r, row) in iconPixels.enumerated() {
-            for (c, pixel) in row.enumerated() where pixel == "1" {
-                // Grid runs top-down; the drawing origin is bottom-left.
-                NSRect(x: CGFloat(c) * cell,
-                       y: (rows - 1 - CGFloat(r)) * cell,
-                       width: cell, height: cell).fill()
-            }
-        }
+    let icon = NSImage(size: NSSize(width: 19, height: 19), flipped: false) { bounds in
+        drawCreoMark(in: bounds.insetBy(dx: 0.5, dy: 0.5))
         return true
     }
     icon.isTemplate = true   // white on a dark menu bar, black on a light one
@@ -471,12 +478,12 @@ struct SessionList: View {
             }
             .frame(height: 360)
 
-            Toggle("Skip permission prompts", isOn: $skipPermissions)
+            Toggle("Run without approval prompts", isOn: $skipPermissions)
                 .toggleStyle(.checkbox)
                 .font(.caption)
                 .foregroundStyle(skipPermissions ? .primary : .secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .help("Resume with --dangerously-skip-permissions, so the session never asks before running a tool")
+                .help("Applies to Claude and Codex. Codex sandbox limits still apply.")
 
             if let newer = updateAvailable {
                 Button {
@@ -525,10 +532,16 @@ struct SessionList: View {
 }
 
 @main
-struct ClaudeSessionsApp: App {
+struct CreoApp: App {
+    @NSApplicationDelegateAdaptor(CreoDelegate.self) private var delegate
+
     init() {
-        // runnable check: `swift run ClaudeSessions --list`
-        // runnable check: `swift run ClaudeSessions --search <text>`
+        // Local visual check without changing login items or shell settings.
+        if CommandLine.arguments.contains("--notch-preview") {
+            return
+        }
+        // runnable check: `swift run creo --list`
+        // runnable check: `swift run creo --search <text>`
         if let i = CommandLine.arguments.firstIndex(of: "--search"), i + 1 < CommandLine.arguments.count {
             let hits = sessionsContaining(CommandLine.arguments[i + 1])
             let rows = loadSessions().filter { hits[$0.sessionID] != nil }
@@ -544,7 +557,19 @@ struct ClaudeSessionsApp: App {
             print("\(s.count) sessions")
             exit(0)
         }
-        // runnable check: `swift run ClaudeSessions --update`
+        if CommandLine.arguments.contains("--usage") {
+            if let usage = CodexUsage.read() {
+                for (name, window) in [("5h", usage.fiveHour), ("Weekly", usage.weekly)] {
+                    if let window {
+                        print("\(name): \(window.remaining)% remaining, resets \(window.resetsAt.formatted())")
+                    }
+                }
+            } else {
+                print("Codex usage unavailable")
+            }
+            exit(0)
+        }
+        // runnable check: `swift run creo --update`
         if CommandLine.arguments.contains("--update") {
             assert(Update.isNewer("1.10.0", than: "1.9.0") && !Update.isNewer("1.9.0", than: "1.10.0"),
                    "version compare is doing a string comparison")
@@ -562,14 +587,36 @@ struct ClaudeSessionsApp: App {
             print("shell notice: \(Update.noticeFile.path)")
             exit(0)
         }
-        Statusline.installIfNeeded()
         enableLaunchAtLogin()
         Update.installShellNotice()
         Update.watch()
+        DispatchQueue.main.async { NotchController.shared.start() }
     }
 
     var body: some Scene {
-        MenuBarExtra { SessionList() } label: { Image(nsImage: statusIcon) }
-            .menuBarExtraStyle(.window)
+        Settings { EmptyView() }
+    }
+}
+
+@MainActor
+final class CreoDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = statusIcon
+        item.button?.toolTip = "Creo — sessions and usage"
+        item.button?.target = self
+        item.button?.action = #selector(toggleNotch)
+        statusItem = item
+        NotchController.shared.statusButton = item.button
+        NotchController.shared.start()
+        if CommandLine.arguments.contains("--open-preview") {
+            NotchController.shared.show()
+        }
+    }
+
+    @objc private func toggleNotch() {
+        NotchController.shared.toggle()
     }
 }

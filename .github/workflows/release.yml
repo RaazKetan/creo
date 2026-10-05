@@ -19,16 +19,16 @@ jobs:
         run: UNIVERSAL=1 ./build.sh
 
       - name: Verify it is universal
-        run: lipo -archs ClaudeSessions.app/Contents/MacOS/ClaudeSessions | tee /dev/stderr | grep -q x86_64
+        run: lipo -archs Creo.app/Contents/MacOS/creo | tee /dev/stderr | grep -q x86_64
 
       - name: Package
-        run: ditto -c -k --keepParent ClaudeSessions.app ClaudeSessions.app.zip
+        run: ditto -c -k --keepParent Creo.app Creo.app.zip
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" ClaudeSessions.app.zip \
+          gh release create "${GITHUB_REF_NAME}" Creo.app.zip \
             --title "${GITHUB_REF_NAME}" --generate-notes
 
       # The tap lives in another repo, so bumping it needs a token this job does not
@@ -37,15 +37,15 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           tarball=$(curl -sL "https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" | shasum -a 256 | cut -d' ' -f1)
-          zip=$(shasum -a 256 ClaudeSessions.app.zip | cut -d' ' -f1)
+          zip=$(shasum -a 256 Creo.app.zip | cut -d' ' -f1)
           {
             echo "## Tap bump for ${GITHUB_REF_NAME}"
             echo '```ruby'
-            echo "# Formula/claude-session-manager.rb"
+            echo "# Formula/creo.rb"
             echo "url \"https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz\""
             echo "sha256 \"${tarball}\""
             echo ""
-            echo "# Casks/claude-sessions.rb"
+            echo "# Casks/creo.rb"
             echo "version \"${version}\""
             echo "sha256 \"${zip}\""
             echo '```'

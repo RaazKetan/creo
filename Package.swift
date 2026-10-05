@@ -2,7 +2,11 @@
 import PackageDescription
 
 let package = Package(
-    name: "ClaudeSessions",
+    name: "Creo",
     platforms: [.macOS(.v13)],
-    targets: [.executableTarget(name: "ClaudeSessions")]
+    products: [.executable(name: "creo", targets: ["Creo"])],
+    targets: [
+        .executableTarget(name: "Creo", path: "Sources/ClaudeSessions",
+                          resources: [.process("Resources")])
+    ]
 )

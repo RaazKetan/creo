@@ -17,7 +17,7 @@ enum Agent: String, CaseIterable {
     func resumeCommand(_ id: String, skipPermissions: Bool) -> String {
         switch self {
         case .claude: return "claude --resume \(id)" + (skipPermissions ? " --dangerously-skip-permissions" : "")
-        case .codex:  return "codex resume \(id)"   // codex has its own approval flags; don't assume them
+        case .codex:  return "codex resume \(id)" + (skipPermissions ? " --ask-for-approval never" : "")
         }
     }
 }
@@ -250,11 +250,20 @@ func runningSessions() -> [String: Int32] {
 /// User-chosen labels, keyed by session id.
 // ponytail: one JSON file in Application Support — the widget reads the same path, so no App Group entitlement is needed.
 enum Names {
-    static let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("ClaudeSessions/names.json")
+    private static let root = FileManager.default.urls(
+        for: .applicationSupportDirectory, in: .userDomainMask
+    )[0]
+    static let url = root.appendingPathComponent("Creo/names.json")
+    private static let legacyURL = root.appendingPathComponent("ClaudeSessions/names.json")
 
     static func load() -> [String: String] {
-        (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: url))) ?? [:]
+        if !FileManager.default.fileExists(atPath: url.path),
+           let legacy = try? Data(contentsOf: legacyURL) {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            try? legacy.write(to: url, options: .atomic)
+        }
+        return (try? JSONDecoder().decode([String: String].self, from: Data(contentsOf: url))) ?? [:]
     }
 
     static func set(_ name: String, for id: String) {

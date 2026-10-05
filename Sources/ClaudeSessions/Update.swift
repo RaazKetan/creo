@@ -8,9 +8,9 @@ import UserNotifications
 //           let the cache expire. Otherwise a release published while the app is running stays
 //           invisible in the panel until the six-hour background check or an app restart.
 enum Update {
-    static let repo = "RaazKetan/claude-session-manager"
-    static let formula = "raazketan/tap/claude-session-manager"
-    static let cask = "claude-sessions"
+    static let repo = "RaazKetan/creo"
+    static let formula = "raazketan/tap/creo"
+    static let cask = "creo"
 
     /// The single command that updates *this* copy.
     ///
@@ -19,7 +19,7 @@ enum Update {
     /// with Homebrew knowing nothing about it.
     ///
     // ponytail: the app can see where it is standing, so it never has to guess. This was one
-    //           hard-coded cask upgrade for everybody, which answered "Cask 'claude-sessions' is
+    //           hard-coded cask upgrade for everybody, which answered "Cask 'creo' is
     //           not installed" for anyone who took the build-from-source route.
     static var upgradeCommand: String {
         guard Bundle.main.bundleURL.path.hasPrefix("/Applications/") else { return "brew upgrade \(formula)" }
@@ -66,6 +66,9 @@ enum Update {
             while true {
                 let newer = await newerVersion()
                 writeShellNotice(newer)
+                if let newer {
+                    await MainActor.run { NotchController.shared.showUpdate(newer) }
+                }
                 if let newer, UserDefaults.standard.string(forKey: "notifiedVersion") != newer {
                     UserDefaults.standard.set(newer, forKey: "notifiedVersion")
                     notify(newer)
@@ -139,7 +142,7 @@ enum Update {
         center.requestAuthorization(options: [.alert]) { granted, _ in
             guard granted else { return }
             let content = UNMutableNotificationContent()
-            content.title = "Claude Sessions \(version) is out"
+            content.title = "Creo \(version) is out"
             content.body = upgradeCommand
             center.add(UNNotificationRequest(identifier: "update-\(version)", content: content, trigger: nil))
         }
@@ -153,7 +156,7 @@ enum Update {
 
     private static func writeShellNotice(_ version: String?) {
         guard let version else { try? FileManager.default.removeItem(at: noticeFile); return }
-        let line = "[claude-sessions] \(version) is out (you have \(current)) — \(upgradeCommand)\n"
+        let line = "[creo] \(version) is out (you have \(current)) — \(upgradeCommand)\n"
         try? FileManager.default.createDirectory(at: noticeFile.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         try? line.write(to: noticeFile, atomically: true, encoding: .utf8)
@@ -162,12 +165,21 @@ enum Update {
     /// Adds the two lines that print it, once, keeping a copy of the file as it was.
     static func installShellNotice() {
         let zshrc = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc")
-        let marker = "# claude-sessions update notice"
-        let existing = (try? String(contentsOf: zshrc, encoding: .utf8)) ?? ""
+        let marker = "# creo update notice"
+        let original = (try? String(contentsOf: zshrc, encoding: .utf8)) ?? ""
+        var existing = original
+        if existing.contains("# claude-sessions update notice") {
+            existing = existing.split(separator: "\n", omittingEmptySubsequences: false)
+                .filter {
+                    !$0.contains("# claude-sessions update notice")
+                        && !$0.contains("Application Support/ClaudeSessions/update-notice")
+                }
+                .joined(separator: "\n")
+        }
         guard !existing.contains(marker) else { return }
 
-        if !existing.isEmpty {   // never touch someone's shell setup without leaving a way back
-            try? existing.write(to: zshrc.appendingPathExtension("claude-sessions-backup"),
+        if !original.isEmpty {   // never touch someone's shell setup without leaving a way back
+            try? original.write(to: zshrc.appendingPathExtension("creo-backup"),
                                 atomically: true, encoding: .utf8)
         }
         let notice = """

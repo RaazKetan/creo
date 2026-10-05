@@ -1,5 +1,7 @@
 .build/
 ClaudeSessions.app/
+Creo.app/
+Creo
 .DS_Store
 .dd/
 *.xcuserdata*
