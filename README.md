@@ -35,10 +35,10 @@ version through Homebrew automatically; Creo then reopens itself.
 ## Features
 
 - Open ChatGPT, Claude, and Perplexity panels from one menu-bar notch.
-- Track Codex five-hour and weekly usage at a glance.
+- Track Claude and Codex five-hour and weekly usage at a glance.
 - Search, filter, rename, and resume local Claude Code and Codex sessions.
-- Open Claude and Perplexity usage in their account dashboards; Perplexity does not
-  expose local sessions here yet.
+- Open Perplexity usage in its account dashboard; Perplexity does not expose local
+  sessions here yet.
 - Jump back to an active session instead of opening a duplicate.
 - Start automatically when you log in.
 - Keep session data private on your Mac.
