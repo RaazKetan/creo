@@ -817,6 +817,7 @@ final class NotchController {
     func showUpdate(_ version: String) {
         guard state.updateVersion != version else { return }
         state.updateVersion = version
+        updateStatusIcon()
         // The rail just grew; resize a visible compact panel to fit the button.
         if let panel, panel.isVisible, !targetExpanded, let screen = panel.screen ?? NSScreen.main {
             position(on: screen)
@@ -915,7 +916,7 @@ final class NotchController {
     /// The icon stays the plain menu-bar template; low plans are named in its tooltip.
     private func updateStatusIcon() {
         guard let button = statusButton else { return }
-        button.image = statusIcon
+        button.image = state.updateVersion == nil ? statusIcon : badgedStatusIcon
         button.imageScaling = .scaleProportionallyDown
         let critical = Service.tracked.flatMap { service in
             [("5h", state.usage[service]?.fiveHour), ("Weekly", state.usage[service]?.weekly)]
@@ -924,7 +925,8 @@ final class NotchController {
                     return "\(service.title) \(name) \(window.remaining)% remaining"
                 }
         }
-        button.toolTip = (["Creo — sessions and usage"] + critical).joined(separator: " · ")
+        let update = state.updateVersion.map { ["Update \($0) available"] } ?? []
+        button.toolTip = (["Creo — sessions and usage"] + update + critical).joined(separator: " · ")
     }
 
     private func position(on screen: NSScreen) {

@@ -238,14 +238,31 @@ private func drawCreoMark(in bounds: NSRect) {
     NSGraphicsContext.restoreGraphicsState()
 }
 
-let statusIcon: NSImage = {
+let statusIcon = makeStatusIcon(badged: false)
+/// The same mark with a dot in its top-right corner, shown while an update is waiting.
+let badgedStatusIcon = makeStatusIcon(badged: true)
+
+private func makeStatusIcon(badged: Bool) -> NSImage {
     let icon = NSImage(size: NSSize(width: 19, height: 19), flipped: false) { bounds in
         drawCreoMark(in: bounds.insetBy(dx: 0.5, dy: 0.5))
+        if badged {
+            let center = NSPoint(x: bounds.maxX - 2.5, y: bounds.maxY - 2.5)
+            func circle(_ r: CGFloat) -> NSBezierPath {
+                NSBezierPath(ovalIn: NSRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2))
+            }
+            // Cut a gap around the dot so it reads as a badge, not part of the mark.
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.compositingOperation = .clear
+            circle(3.6).fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSColor.black.setFill()
+            circle(2.4).fill()
+        }
         return true
     }
     icon.isTemplate = true   // white on a dark menu bar, black on a light one
     return icon
-}()
+}
 
 struct SessionList: View {
     @State private var sessions: [Session] = []

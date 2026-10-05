@@ -52,7 +52,9 @@ enum Update {
             "-c",
             """
             brew="$0"; pid="$1"; bundle="$2"; mode="$3"; log="$4"; expected="$5"
-            "$brew" update >"$log" 2>&1 || exit $?
+            # A failing refresh (often some unrelated tap) must not block the upgrade; the
+            # version check below still catches a tap that really is behind.
+            "$brew" update >"$log" 2>&1 || echo "brew update failed; trying the upgrade anyway" >>"$log"
             case "$mode" in
               cask) "$brew" upgrade --cask raazketan/tap/creo >>"$log" 2>&1 ;;
               formula) "$brew" upgrade --formula raazketan/tap/creo >>"$log" 2>&1 ;;
