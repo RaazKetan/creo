@@ -880,7 +880,7 @@ final class NotchController {
         }
     }
 
-    /// A steady red icon while any plan is under 20%. It used to pulse, which read as flicker.
+    /// The icon stays the plain menu-bar template; low plans are named in its tooltip.
     private func updateStatusIcon() {
         guard let button = statusButton else { return }
         button.image = statusIcon
@@ -892,7 +892,6 @@ final class NotchController {
                     return "\(service.title) \(name) \(window.remaining)% remaining"
                 }
         }
-        button.contentTintColor = critical.isEmpty ? nil : .systemRed
         button.toolTip = (["Creo — sessions and usage"] + critical).joined(separator: " · ")
     }
 
