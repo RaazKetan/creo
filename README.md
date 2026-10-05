@@ -9,10 +9,10 @@ usage, and continuing Claude Code and Codex sessions.
 
 ```sh
 brew install --cask RaazKetan/tap/creo
-open /Applications/Creo.app
 ```
 
-Requires macOS 13 or newer. Supports Apple Silicon and Intel Macs.
+Creo opens automatically after installation. Requires macOS 13 or newer and
+supports Apple Silicon and Intel Macs.
 If Creo was previously installed manually, quit it and move the existing
 `/Applications/Creo.app` to the Trash before running the Homebrew command.
 
