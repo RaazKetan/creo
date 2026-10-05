@@ -13,6 +13,8 @@ open /Applications/Creo.app
 ```
 
 Requires macOS 13 or newer. Supports Apple Silicon and Intel Macs.
+If Creo was previously installed manually, quit it and move the existing
+`/Applications/Creo.app` to the Trash before running the Homebrew command.
 
 To build from source instead:
 
