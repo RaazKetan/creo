@@ -7,19 +7,24 @@ usage, and continuing Claude Code and Codex sessions.
 
 ## Install
 
-Until the Creo Homebrew package is published, install from source with the
-included script. This needs the Xcode Command Line Tools.
-
 ```sh
-curl -fsSL https://raw.githubusercontent.com/RaazKetan/creo/main/install.sh | zsh
+brew install --cask RaazKetan/tap/creo
+open /Applications/Creo.app
 ```
 
 Requires macOS 13 or newer. Supports Apple Silicon and Intel Macs.
 
+To build from source instead:
+
+```sh
+brew install RaazKetan/tap/creo
+open "$(brew --prefix)/opt/creo/Creo.app"
+```
+
 ## Update
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/RaazKetan/creo/main/install.sh | zsh
+brew upgrade --cask RaazKetan/tap/creo
 ```
 
 Creo checks for new releases, shows an update notice, and reopens itself after
@@ -47,10 +52,15 @@ open Creo.app
 
 ## Uninstall
 
-Quit Creo, remove `/Applications/Creo.app`, and delete
-`~/Library/LaunchAgents/io.github.raazketan.creo.plist` to stop it starting at
-login. The app's settings and custom session names remain in
-`~/Library/Application Support/ClaudeSessions` unless you remove them too.
+```sh
+brew uninstall --cask RaazKetan/tap/creo
+```
+
+To also remove Creo's settings, saved names, and login item:
+
+```sh
+brew uninstall --cask --zap RaazKetan/tap/creo
+```
 
 ## License
 
