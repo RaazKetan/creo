@@ -728,7 +728,7 @@ final class NotchController {
         refreshUsage()
         Task {
             while true {
-                try? await Task.sleep(for: .seconds(5 * 60))
+                try? await Task.sleep(for: .seconds(2 * 60))
                 refreshUsage()
             }
         }
@@ -757,7 +757,7 @@ final class NotchController {
         panel.alphaValue = 0
         state.refreshToken += 1
         // Ask again on every open (cached for a minute), so a release published while the app
-        // was running shows up now instead of at the next six-hour check.
+        // was running shows up now instead of at the next two-hour check.
         Task { if let newer = await Update.newerVersion() { showUpdate(newer) } }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)

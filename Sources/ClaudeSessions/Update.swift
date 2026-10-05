@@ -6,7 +6,7 @@ import UserNotifications
 /// No information about you is sent; the check is one unauthenticated GET for a tag name.
 // ponytail: cache checks briefly so repeatedly opening the panel does not hammer GitHub, but do
 //           let the cache expire. Otherwise a release published while the app is running stays
-//           invisible in the panel until the six-hour background check or an app restart.
+//           invisible in the panel until the two-hour background check or an app restart.
 enum Update {
     static let repo = "RaazKetan/creo"
     static let formula = "raazketan/tap/creo"
@@ -126,7 +126,7 @@ enum Update {
         return result
     }
 
-    /// Checks now, then every six hours, and says so once per release — in Notification Center,
+    /// Checks now, then every two hours, and says so once per release — in Notification Center,
     /// and as a line new terminals print, so you hear about it without opening the panel.
     static func watch() {
         watchForInstalledReplacement()
@@ -141,7 +141,7 @@ enum Update {
                     UserDefaults.standard.set(newer, forKey: "notifiedVersion")
                     notify(newer)
                 }
-                try? await Task.sleep(for: .seconds(6 * 3600))
+                try? await Task.sleep(for: .seconds(2 * 3600))
                 cached = nil   // so the next round actually asks GitHub again
             }
         }
