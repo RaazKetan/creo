@@ -589,13 +589,46 @@ struct CreoApp: App {
             precondition(PlanUsage.claudeToken(secret(#""accessToken":"t","expiresAt":1000"#)).token == nil)
             precondition(PlanUsage.claudeToken(secret(#""accessToken":"t","expiresAt":99999999999999"#)).token == "t")
             precondition(PlanUsage.claudeToken(secret(#""accessToken":"t""#)).token == "t")
+            precondition(PlanUsage.planName("max", tier: "default_claude_max_20x") == "Ultra")
+            precondition(PlanUsage.planName("max", tier: "default_claude_max_5x") == "Max")
+            precondition(PlanUsage.planName("ultra") == "Ultra")
+            precondition(PlanUsage.planName("plus") == "Plus")
+            precondition(PlanUsage.planName("") == nil && PlanUsage.planName(nil) == nil)
+            for (id, name) in [("plus", "Plus"), ("pro", "Pro"), ("prolite", "Pro"), ("promax", "Pro"), ("go", "Go"), ("free", "Free"),
+                               ("team", "Team"), ("business", "Business"), ("self_serve_business_usage_based", "Business"),
+                               ("ent26", "Enterprise"), ("enterprise_cbp_automation", "Enterprise"), ("edu_plus", "Edu"), ("education", "Edu")] {
+                precondition(PlanUsage.codexPlanName(id) == name, id)
+            }
+            precondition(PlanUsage.codexPlanName("something_new") == nil && PlanUsage.codexPlanName(nil) == nil)
+            func codex(_ limits: String) -> PlanUsage? {
+                ((try? JSONSerialization.jsonObject(with: Data(#"{"rateLimits":\#(limits)}"#.utf8))) as? [String: Any]).flatMap { PlanUsage(codex: $0) }
+            }
+            let short = #"{"usedPercent":10,"windowDurationMins":300,"resetsAt":4000000000}"#
+            let long = #"{"usedPercent":20,"windowDurationMins":10080,"resetsAt":4000000000}"#
+            let bare = #"{"usedPercent":30,"resetsAt":4000000000}"#
+            for (limits, five, week) in [(#"{"primary":\#(short),"secondary":\#(long)}"#, 90, 80),   // Plus today
+                                         (#"{"primary":\#(long),"secondary":null}"#, nil, 80),        // no 5-hour limit
+                                         (#"{"primary":null,"secondary":\#(long)}"#, nil, 80),
+                                         (#"{"primary":\#(long),"secondary":\#(short)}"#, 90, 80),   // swapped
+                                         (#"{"primary":\#(short),"secondary":null}"#, 90, nil),
+                                         (#"{"primary":\#(bare),"secondary":\#(bare)}"#, 70, 70)] as [(String, Int?, Int?)] {
+                precondition(codex(limits)?.fiveHour?.remaining == five && codex(limits)?.weekly?.remaining == week, limits)
+            }
+            func saved(_ stamp: String) -> PlanUsage? {
+                PlanUsage.savedClaude(Data(#"{"five_hour":null,"seven_day":{"utilization":52.0,"resets_at":"\#(stamp)"}}"#.utf8))
+            }
+            precondition(saved("2999-01-01T00:00:00.5+00:00")?.weekly?.remaining == 48)
+            precondition(saved("2000-01-01T00:00:00+00:00") == nil)
+            precondition(PlanUsage.savedClaude(nil) == nil)
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
-                let claude = await PlanUsage.readClaude()
+                let (claude, claudePlan) = await PlanUsage.readClaude()
+                if let claudePlan { print("Claude plan: \(claudePlan)") }
                 var claudeUsage: PlanUsage?
                 if case .usage(let usage) = claude { claudeUsage = usage }
                 for (title, usage) in [("Codex", PlanUsage.readCodex()), ("Claude", claudeUsage)] {
                     guard let usage else { print("\(title) usage unavailable. \(title == "Claude" ? claude.note ?? "" : "")"); continue }
+                    if let plan = usage.plan { print("\(title) plan: \(plan)") }
                     for (name, window) in [("5h", usage.fiveHour), ("Weekly", usage.weekly)] {
                         if let window {
                             print("\(title) \(name): \(window.remaining)% remaining, resets \(window.resetsAt.formatted())")

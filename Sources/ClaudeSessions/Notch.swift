@@ -51,17 +51,42 @@ enum ClaudeRead {
 struct PlanUsage {
     let fiveHour: UsageWindow?
     let weekly: UsageWindow?
+    let plan: String?
 
     init?(fiveHour: UsageWindow?, weekly: UsageWindow?) {
         guard fiveHour != nil || weekly != nil else { return nil }
         self.fiveHour = fiveHour
         self.weekly = weekly
+        plan = nil
+    }
+
+    /// "plus" reads "Plus". Older sign-ins still say "max" with a "_20x" tier, which is now Ultra.
+    static func planName(_ type: String?, tier: String? = nil) -> String? {
+        guard let type, !type.isEmpty else { return nil }
+        return type == "max" && tier?.hasSuffix("_20x") == true ? "Ultra" : type.capitalized
+    }
+
+    /// The CLI's internal plan ids, grouped under the names people know. "pro", "prolite" and
+    /// "promax" are all Pro. An id we haven't seen shows no badge rather than a raw one.
+    static func codexPlanName(_ type: String?) -> String? {
+        guard let type, !type.isEmpty else { return nil }
+        if type.hasPrefix("pro") { return "Pro" }
+        if type.contains("business") { return "Business" }
+        if type.hasPrefix("ent") { return "Enterprise" }
+        if type.hasPrefix("edu") { return "Edu" }
+        return ["free", "go", "plus", "team"].contains(type) ? type.capitalized : nil
     }
 
     init?(codex result: [String: Any]) {
         guard let limits = result["rateLimits"] as? [String: Any] else { return nil }
-        fiveHour = UsageWindow(limits["primary"] as? [String: Any])
-        weekly = UsageWindow(limits["secondary"] as? [String: Any])
+        // A plan with no 5-hour limit can report its weekly window first, so go by each window's
+        // length. Older CLIs don't send one: primary is then the short window, secondary the long.
+        let first = limits["primary"] as? [String: Any], second = limits["secondary"] as? [String: Any]
+        func isLong(_ window: [String: Any]?) -> Bool? { (window?["windowDurationMins"] as? Double).map { $0 >= 24 * 60 } }
+        let firstLong = isLong(first) ?? false, secondLong = isLong(second) ?? true
+        fiveHour = UsageWindow(!firstLong ? first : !secondLong ? second : nil)
+        weekly = UsageWindow(firstLong ? first : secondLong ? second : nil)
+        plan = PlanUsage.codexPlanName(limits["planType"] as? String)
         guard fiveHour != nil || weekly != nil else { return nil }
     }
 
@@ -117,7 +142,7 @@ struct PlanUsage {
     /// The same windows Claude Code's `/usage` shows. Claude Code keeps its sign-in in the
     /// Keychain; `security` is already trusted to read that item, so there is no prompt.
     /// The token is used for this one request and never stored.
-    static func readClaude() async -> ClaudeRead {
+    static func readClaude(ignoringPause: Bool = false) async -> (read: ClaudeRead, plan: String?) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
@@ -133,11 +158,11 @@ struct PlanUsage {
             secret = (try? Data(contentsOf: FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude/.credentials.json"))) ?? Data()
         }
-        let (token, problem) = claudeToken(secret)
-        guard let token else { return problem ?? .signedOut }
+        let (token, problem, plan) = claudeToken(secret)
+        guard let token else { return (problem ?? .signedOut, plan) }
         // Kept across launches: restarting Creo shouldn't extend a rate limit.
         let retryKey = "claudeUsageRetryAt"
-        if Date().timeIntervalSince1970 < UserDefaults.standard.double(forKey: retryKey) { return .rateLimited }
+        if !ignoringPause, Date().timeIntervalSince1970 < UserDefaults.standard.double(forKey: retryKey) { return (.rateLimited, plan) }
 
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!,
                                  timeoutInterval: 10)
@@ -145,32 +170,58 @@ struct PlanUsage {
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         // ponytail: never renew the token here. Refresh tokens rotate, so using it would sign
         //           Claude Code out; Claude Code renews it next run.
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let status = (response as? HTTPURLResponse)?.statusCode else { return .unreachable }
-        if status == 401 { return .expired }
+        // ponytail: this endpoint answers 429 with Retry-After 0 and then 200 moments later, so a
+        //           read tries three times, ten seconds apart, before giving up for a minute.
+        var reply = try? await URLSession.shared.data(for: request)
+        for _ in 1...2 where (reply?.1 as? HTTPURLResponse)?.statusCode == 429
+            && (reply?.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After") == "0" {
+            try? await Task.sleep(for: .seconds(10))
+            reply = try? await URLSession.shared.data(for: request)
+        }
+        guard let (data, response) = reply,
+              let status = (response as? HTTPURLResponse)?.statusCode else { return (.unreachable, plan) }
+        if status == 401 { return (.expired, plan) }
         if status == 429 {
-            let wait = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 300
-            // ponytail: capped because it has asked for an hour, then answered minutes later.
-            UserDefaults.standard.set(Date().timeIntervalSince1970 + min(wait, 600), forKey: retryKey)
-            return .rateLimited
+            // ponytail: Retry-After has been 0, 223 and 3550, yet reads worked again within minutes.
+            //           Wait a minute on 0 or missing, and never more than ten, so usage isn't hidden.
+            let wait = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 0
+            UserDefaults.standard.set(Date().timeIntervalSince1970 + (wait > 0 ? min(wait, 600) : 60), forKey: retryKey)
+            return (.rateLimited, plan)
         }
         guard status == 200,
               let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let usage = PlanUsage(fiveHour: UsageWindow(claude: body["five_hour"] as? [String: Any]),
-                                    weekly: UsageWindow(claude: body["seven_day"] as? [String: Any]))
-        else { return .unreachable }
-        return .usage(usage)
+              let usage = PlanUsage(claude: body)
+        else { return (.unreachable, plan) }
+        let kept = body.filter { $0.key == "five_hour" || $0.key == "seven_day" }
+        UserDefaults.standard.set(try? JSONSerialization.data(withJSONObject: kept), forKey: claudeSavedKey)
+        return (.usage(usage), plan)
+    }
+
+    init?(claude body: [String: Any]) {
+        self.init(fiveHour: UsageWindow(claude: body["five_hour"] as? [String: Any]),
+                  weekly: UsageWindow(claude: body["seven_day"] as? [String: Any]))
+    }
+
+    /// The last good reading, so a rate limit at launch still has numbers to show.
+    /// A window that has since reset is dropped: its percentage no longer means anything.
+    static let claudeSavedKey = "claudeUsageSaved"
+    static func savedClaude(_ data: Data?, now: Date = Date()) -> PlanUsage? {
+        guard let data, let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let saved = PlanUsage(claude: body) else { return nil }
+        return PlanUsage(fiveHour: saved.fiveHour.flatMap { $0.resetsAt > now ? $0 : nil },
+                         weekly: saved.weekly.flatMap { $0.resetsAt > now ? $0 : nil })
     }
 
     /// The usable token in Claude Code's stored credentials, or why there isn't one.
-    static func claudeToken(_ secret: Data, now: Date = Date()) -> (token: String?, problem: ClaudeRead?) {
+    static func claudeToken(_ secret: Data, now: Date = Date()) -> (token: String?, problem: ClaudeRead?, plan: String?) {
         guard let credentials = (try? JSONSerialization.jsonObject(with: secret)) as? [String: Any],
               let oauth = credentials["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else { return (nil, .signedOut) }
+              let token = oauth["accessToken"] as? String else { return (nil, .signedOut, nil) }
+        let plan = planName(oauth["subscriptionType"] as? String, tier: oauth["rateLimitTier"] as? String)
         if let expiry = oauth["expiresAt"] as? Double, expiry / 1000 <= now.timeIntervalSince1970 {
-            return (nil, .expired)
+            return (nil, .expired, plan)
         }
-        return (token, nil)
+        return (token, nil, plan)
     }
 }
 
@@ -178,6 +229,8 @@ struct PlanUsage {
 final class NotchState: ObservableObject {
     @Published var usage: [Service: PlanUsage] = [:]
     @Published var claudeNote: String? = "Reading usage…"
+    /// From the stored sign-in, so it stays known while the usage request is failing.
+    @Published var claudePlan: String?
     @Published var updateVersion: String?
     @Published var isUpdating = false
     @Published var updateFailure: String?
@@ -399,6 +452,16 @@ private struct NotchView: View {
                     .frame(width: 16, height: 16)
                 Text(selected.title)
                     .font(.system(size: 13, weight: .semibold))
+                if let plan = selected == .claude ? state.claudePlan : state.usage[selected]?.plan {
+                    Text(plan)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.1), in: Capsule())
+                }
                 Spacer()
                 if let version = state.updateVersion {
                     Button { startUpdate(version) } label: {
@@ -632,7 +695,7 @@ private struct NotchView: View {
                 Spacer()
                 if Service.tracked.contains(selected) {
                     Button {
-                        NotchController.shared.refreshUsage()
+                        NotchController.shared.refreshUsage(ignoringPause: true)   // an explicit ask
                     } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.plain)
                         .help("Refresh usage")
@@ -756,6 +819,7 @@ final class NotchController {
     private var panel: NotchPanel?
     private var outsideClickMonitors: [Any] = []
     private var animationID = 0
+    private var lastUsageRefresh = Date.distantPast
     private var isHiding = false
     private var targetExpanded = false
 
@@ -776,13 +840,8 @@ final class NotchController {
         }))
         self.panel = panel
         position(on: screen)
+        state.usage[.claude] = PlanUsage.savedClaude(UserDefaults.standard.data(forKey: PlanUsage.claudeSavedKey))
         refreshUsage()
-        Task {
-            while true {
-                try? await Task.sleep(for: .seconds(2 * 60))
-                refreshUsage()
-            }
-        }
     }
 
     func toggle() {
@@ -807,8 +866,9 @@ final class NotchController {
         panel.setFrame(target, display: false)
         panel.alphaValue = 0
         state.refreshToken += 1
-        // While Claude's numbers are missing, opening retries, so a new sign-in shows up at once.
-        if state.claudeNote != nil { refreshUsage() }
+        // ponytail: read on open, not on a timer, because Claude's endpoint rate limits. The floor
+        //           only stops quick re-clicks from spending requests; ↻ always reads.
+        if Date().timeIntervalSince(lastUsageRefresh) > 30 { refreshUsage() }
         // Ask again on every open (cached for a minute), so a release published while the app
         // was running shows up now instead of at the next two-hour check.
         Task { if let newer = await Update.newerVersion() { showUpdate(newer) } }
@@ -953,20 +1013,24 @@ final class NotchController {
         }
     }
 
-    func refreshUsage() {
+    func refreshUsage(ignoringPause: Bool = false) {
+        lastUsageRefresh = Date()
         Task.detached(priority: .utility) {
             async let codex = PlanUsage.readCodex()
-            async let claude = PlanUsage.readClaude()
-            let (codexUsage, claudeRead) = await (codex, claude)
+            async let claude = PlanUsage.readClaude(ignoringPause: ignoringPause)
+            let (codexUsage, (claudeRead, claudePlan)) = await (codex, claude)
             await MainActor.run {
                 // A failed read keeps the last good value instead of blanking the ring.
                 if let codexUsage { self.state.usage[.chatgpt] = codexUsage }
                 switch claudeRead {
                 case .usage(let usage): self.state.usage[.claude] = usage
-                case .signedOut: self.state.usage[.claude] = nil   // those numbers aren't yours now
+                case .signedOut:   // those numbers aren't yours now
+                    self.state.usage[.claude] = nil
+                    UserDefaults.standard.removeObject(forKey: PlanUsage.claudeSavedKey)
                 case .expired, .rateLimited, .unreachable: break
                 }
                 self.state.claudeNote = claudeRead.note
+                self.state.claudePlan = claudePlan
                 self.updateStatusIcon()
             }
         }
