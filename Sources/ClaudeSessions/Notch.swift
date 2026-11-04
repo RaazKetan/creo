@@ -32,6 +32,22 @@ struct UsageWindow {
     }
 }
 
+/// Why Claude's numbers are, or aren't, on screen. Being signed in and having a usable token
+/// are different things: Claude Code only renews its token while it runs.
+enum ClaudeRead {
+    case usage(PlanUsage), signedOut, expired, rateLimited, unreachable
+
+    var note: String? {
+        switch self {
+        case .usage: nil
+        case .signedOut: "Sign in to Claude Code to see usage here."
+        case .expired: "Claude Code's sign-in has expired. Run claude once to refresh usage."
+        case .rateLimited: "Claude is limiting usage checks. Creo will retry shortly."
+        case .unreachable: "Couldn't read Claude usage. Creo will retry."
+        }
+    }
+}
+
 struct PlanUsage {
     let fiveHour: UsageWindow?
     let weekly: UsageWindow?
@@ -101,7 +117,7 @@ struct PlanUsage {
     /// The same windows Claude Code's `/usage` shows. Claude Code keeps its sign-in in the
     /// Keychain; `security` is already trusted to read that item, so there is no prompt.
     /// The token is used for this one request and never stored.
-    static func readClaude() async -> PlanUsage? {
+    static func readClaude() async -> ClaudeRead {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
@@ -117,27 +133,51 @@ struct PlanUsage {
             secret = (try? Data(contentsOf: FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude/.credentials.json"))) ?? Data()
         }
-        guard let credentials = (try? JSONSerialization.jsonObject(with: secret)) as? [String: Any],
-              let oauth = credentials["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else { return nil }
+        let (token, problem) = claudeToken(secret)
+        guard let token else { return problem ?? .signedOut }
+        // Kept across launches: restarting Creo shouldn't extend a rate limit.
+        let retryKey = "claudeUsageRetryAt"
+        if Date().timeIntervalSince1970 < UserDefaults.standard.double(forKey: retryKey) { return .rateLimited }
 
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!,
                                  timeoutInterval: 10)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        // ponytail: an expired token just reads as unavailable; Claude Code refreshes it next run.
+        // ponytail: never renew the token here. Refresh tokens rotate, so using it would sign
+        //           Claude Code out; Claude Code renews it next run.
         guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200,
-              let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return nil }
-        return PlanUsage(fiveHour: UsageWindow(claude: body["five_hour"] as? [String: Any]),
-                         weekly: UsageWindow(claude: body["seven_day"] as? [String: Any]))
+              let status = (response as? HTTPURLResponse)?.statusCode else { return .unreachable }
+        if status == 401 { return .expired }
+        if status == 429 {
+            let wait = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init) ?? 300
+            // ponytail: capped because it has asked for an hour, then answered minutes later.
+            UserDefaults.standard.set(Date().timeIntervalSince1970 + min(wait, 600), forKey: retryKey)
+            return .rateLimited
+        }
+        guard status == 200,
+              let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let usage = PlanUsage(fiveHour: UsageWindow(claude: body["five_hour"] as? [String: Any]),
+                                    weekly: UsageWindow(claude: body["seven_day"] as? [String: Any]))
+        else { return .unreachable }
+        return .usage(usage)
+    }
+
+    /// The usable token in Claude Code's stored credentials, or why there isn't one.
+    static func claudeToken(_ secret: Data, now: Date = Date()) -> (token: String?, problem: ClaudeRead?) {
+        guard let credentials = (try? JSONSerialization.jsonObject(with: secret)) as? [String: Any],
+              let oauth = credentials["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String else { return (nil, .signedOut) }
+        if let expiry = oauth["expiresAt"] as? Double, expiry / 1000 <= now.timeIntervalSince1970 {
+            return (nil, .expired)
+        }
+        return (token, nil)
     }
 }
 
 @MainActor
 final class NotchState: ObservableObject {
     @Published var usage: [Service: PlanUsage] = [:]
+    @Published var claudeNote: String? = "Reading usage…"
     @Published var updateVersion: String?
     @Published var isUpdating = false
     @Published var updateFailure: String?
@@ -559,6 +599,11 @@ private struct NotchView: View {
         .help("\(service.title): \(usageHint(service))")
     }
 
+    /// Why the numbers on screen may be old: Claude's last read failed but an earlier one worked.
+    private func staleNote(_ service: Service) -> String? {
+        service == .claude && state.usage[.claude] != nil ? state.claudeNote : nil
+    }
+
     @ViewBuilder
     private func usageRings(_ usage: PlanUsage) -> some View {
         // The short allowance is the primary signal, so it owns the larger,
@@ -580,7 +625,9 @@ private struct NotchView: View {
     private func usageSection(for selected: Service) -> some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack {
-                Text("Usage remaining")
+                // Numbers kept from an earlier read stay on screen, so say so without adding a row.
+                Text(staleNote(selected) == nil ? "Usage remaining" : "Usage may be out of date")
+                    .help(staleNote(selected) ?? "")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
                 if Service.tracked.contains(selected) {
@@ -594,8 +641,12 @@ private struct NotchView: View {
             if Service.tracked.contains(selected) {
                 if let window = state.usage[selected]?.fiveHour { UsageBar(title: "5h", window: window) }
                 if let window = state.usage[selected]?.weekly { UsageBar(title: "Weekly", window: window) }
-                if state.usage[selected] == nil {
-                    Text("Sign in to \(selected == .claude ? "Claude Code" : "Codex") to see usage here.")
+                if selected == .claude, staleNote(selected) == nil, let note = state.claudeNote {
+                    Text(note)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.primary.opacity(0.6))
+                } else if selected == .chatgpt, state.usage[selected] == nil {
+                    Text("Sign in to Codex to see usage here.")
                         .font(.system(size: 11))
                         .foregroundStyle(Color.primary.opacity(0.6))
                 }
@@ -756,6 +807,8 @@ final class NotchController {
         panel.setFrame(target, display: false)
         panel.alphaValue = 0
         state.refreshToken += 1
+        // While Claude's numbers are missing, opening retries, so a new sign-in shows up at once.
+        if state.claudeNote != nil { refreshUsage() }
         // Ask again on every open (cached for a minute), so a release published while the app
         // was running shows up now instead of at the next two-hour check.
         Task { if let newer = await Update.newerVersion() { showUpdate(newer) } }
@@ -904,10 +957,16 @@ final class NotchController {
         Task.detached(priority: .utility) {
             async let codex = PlanUsage.readCodex()
             async let claude = PlanUsage.readClaude()
-            let results: [(Service, PlanUsage?)] = [(.chatgpt, await codex), (.claude, await claude)]
+            let (codexUsage, claudeRead) = await (codex, claude)
             await MainActor.run {
                 // A failed read keeps the last good value instead of blanking the ring.
-                for case let (service, usage?) in results { self.state.usage[service] = usage }
+                if let codexUsage { self.state.usage[.chatgpt] = codexUsage }
+                switch claudeRead {
+                case .usage(let usage): self.state.usage[.claude] = usage
+                case .signedOut: self.state.usage[.claude] = nil   // those numbers aren't yours now
+                case .expired, .rateLimited, .unreachable: break
+                }
+                self.state.claudeNote = claudeRead.note
                 self.updateStatusIcon()
             }
         }

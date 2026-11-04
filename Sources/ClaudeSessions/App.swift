@@ -584,10 +584,18 @@ struct CreoApp: App {
             exit(0)
         }
         if CommandLine.arguments.contains("--usage") {
+            func secret(_ oauth: String) -> Data { Data("{\"claudeAiOauth\":{\(oauth)}}".utf8) }
+            precondition(PlanUsage.claudeToken(Data()).token == nil)
+            precondition(PlanUsage.claudeToken(secret(#""accessToken":"t","expiresAt":1000"#)).token == nil)
+            precondition(PlanUsage.claudeToken(secret(#""accessToken":"t","expiresAt":99999999999999"#)).token == "t")
+            precondition(PlanUsage.claudeToken(secret(#""accessToken":"t""#)).token == "t")
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
-                for (title, usage) in [("Codex", PlanUsage.readCodex()), ("Claude", await PlanUsage.readClaude())] {
-                    guard let usage else { print("\(title) usage unavailable"); continue }
+                let claude = await PlanUsage.readClaude()
+                var claudeUsage: PlanUsage?
+                if case .usage(let usage) = claude { claudeUsage = usage }
+                for (title, usage) in [("Codex", PlanUsage.readCodex()), ("Claude", claudeUsage)] {
+                    guard let usage else { print("\(title) usage unavailable. \(title == "Claude" ? claude.note ?? "" : "")"); continue }
                     for (name, window) in [("5h", usage.fiveHour), ("Weekly", usage.weekly)] {
                         if let window {
                             print("\(title) \(name): \(window.remaining)% remaining, resets \(window.resetsAt.formatted())")
