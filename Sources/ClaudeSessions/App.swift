@@ -5,6 +5,7 @@ import ServiceManagement
 // ponytail: skipPermissions is opt-in and off by default. Claude bypasses its
 //           permission prompts; Codex skips approval prompts but keeps its sandbox.
 func resume(_ s: Session, skipPermissions: Bool = false) {
+    if s.agent == .antigravity { return openInAntigravity(s) }
     if focusRunningSession(s) { return }
 
     let quoted = "'" + s.cwd.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -39,6 +40,23 @@ func resume(_ s: Session, skipPermissions: Bool = false) {
     NSWorkspace.shared.open([url],
                             withApplicationAt: isTerminal ? handler! : URL(fileURLWithPath: fallbackTerminal),
                             configuration: NSWorkspace.OpenConfiguration())
+}
+
+/// Opens an Antigravity conversation's project in the Antigravity IDE.
+// ponytail: the folder, not the conversation. No link into a conversation was found, and
+//           `agy --conversation` is untested here. Pick it from the agent panel once open.
+func openInAntigravity(_ s: Session) {
+    let folder = URL(fileURLWithPath: s.cwd)
+    // The IDE by its bundle id, then anything installed with Antigravity in its name, in case it
+    // is renamed again. Failing both, show the folder rather than do nothing.
+    let known = ["com.google.antigravity-ide", "com.google.antigravity"].lazy
+        .compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) }.first
+    let named = ((try? FileManager.default.contentsOfDirectory(atPath: "/Applications")) ?? [])
+        .filter { $0.localizedCaseInsensitiveContains("antigravity") && $0.hasSuffix(".app") }
+        .sorted { $0.contains("IDE") && !$1.contains("IDE") }   // the editor over the agent app
+        .first.map { URL(fileURLWithPath: "/Applications/" + $0) }
+    guard let app = known ?? named else { return NSWorkspace.shared.activateFileViewerSelecting([folder]) }
+    NSWorkspace.shared.open([folder], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
 }
 
 private let fallbackTerminal = "/System/Applications/Utilities/Terminal.app"
@@ -475,8 +493,11 @@ struct SessionList: View {
                                 }
                             }
                             Divider()
-                            Button("Move to Trash…", role: .destructive) {
-                                if confirmAndTrash(s) { sessions = loadSessions() }
+                            // Antigravity keeps its own record of a conversation; trashing one file leaves it listed.
+                            if s.agent != .antigravity {
+                                Button("Move to Trash…", role: .destructive) {
+                                    if confirmAndTrash(s) { sessions = loadSessions() }
+                                }
                             }
                             Button("Copy session id") {
                                 NSPasteboard.general.clearContents()
@@ -599,7 +620,8 @@ struct CreoApp: App {
                                ("ent26", "Enterprise"), ("enterprise_cbp_automation", "Enterprise"), ("edu_plus", "Edu"), ("education", "Edu")] {
                 precondition(PlanUsage.codexPlanName(id) == name, id)
             }
-            precondition(PlanUsage.codexPlanName("something_new") == nil && PlanUsage.codexPlanName(nil) == nil)
+            precondition(PlanUsage.codexPlanName("something_new") == "Something New" && PlanUsage.codexPlanName(nil) == nil)
+            precondition(PlanUsage.codexPlanName("self_serve_something_usage_based_v2") == nil)
             func codex(_ limits: String) -> PlanUsage? {
                 ((try? JSONSerialization.jsonObject(with: Data(#"{"rateLimits":\#(limits)}"#.utf8))) as? [String: Any]).flatMap { PlanUsage(codex: $0) }
             }
@@ -614,6 +636,36 @@ struct CreoApp: App {
                                          (#"{"primary":\#(bare),"secondary":\#(bare)}"#, 70, 70)] as [(String, Int?, Int?)] {
                 precondition(codex(limits)?.fiveHour?.remaining == five && codex(limits)?.weekly?.remaining == week, limits)
             }
+            let status = #"{"userStatus":{"userTier":{"name":"Google AI Pro"},"cascadeModelConfigData":{"clientModelConfigs":[{"modelId":"no-label","quotaInfo":{"remainingFraction":1,"resetTime":"2999-01-01T00:00:00Z"}},{"label":"A","quotaInfo":{"remainingFraction":0.25,"resetTime":"2999-01-01T00:00:00Z"}},{"label":"Used up","quotaInfo":{"resetTime":"2999-01-01T00:00:00Z"}},{"label":"No quota","quotaInfo":{}}]}}}"#
+            let ag = (try? JSONSerialization.jsonObject(with: Data(status.utf8)) as? [String: Any]).flatMap { AntigravityUsage(status: $0) }
+            precondition(ag?.plan == "Pro" && ag?.models.map(\.name) == ["no-label", "A", "Used up"])
+            precondition(ag?.models.map(\.window.remaining) == [100, 25, 0] && ag?.lowest?.remaining == 0)
+            func model(_ name: String, _ left: Int, _ reset: Double = 4e9) -> AntigravityUsage.Model {
+                .init(name: name, window: UsageWindow(remaining: left, resetsAt: Date(timeIntervalSince1970: reset)))
+            }
+            let flash = AntigravityUsage(plan: nil, models: [model("Flash (High)", 100), model("Flash (Medium)", 100),
+                                                              model("Flash (Low)", 100), model("Opus (Thinking)", 40),
+                                                              model("Pro (High)", 90), model("Pro (Low)", 50)])
+            precondition(flash.grouped.map(\.name) == ["Flash", "Opus", "Pro (High)", "Pro (Low)"])
+            precondition(AntigravityUsage(plan: nil, models: [model("A (x)", 9, 1), model("A (y)", 9, 2)]).grouped.count == 2)
+            // Least left first; on a tie, the most tokens (a grouped name collects its variants), then the original order.
+            let picks = AntigravityUsage(plan: nil, models: [model("A", 100), model("B (x)", 100), model("B (y)", 100),
+                                                             model("C", 40), model("D", 100)])
+            precondition(picks.ordered(byTokens: ["D": 5, "B (x)": 3, "B (y)": 4]).map(\.name) == ["C", "B", "D", "A"])
+            precondition(picks.ordered(byTokens: [:]).map(\.name) == ["C", "A", "B", "D"])
+            let reply = #"{"generatorMetadata":[{"chatModel":{"modelDisplayName":"M","retryInfos":[{"usage":{"inputTokens":"100","outputTokens":"7"}},{"traceId":"x"}]}},{"chatModel":{"retryInfos":[{"usage":{"inputTokens":"50","outputTokens":"3"}}]}}]}"#
+            let used = (try? JSONSerialization.jsonObject(with: Data(reply.utf8)) as? [String: Any]).flatMap(AntigravityUsage.tokens(in:))
+            precondition(used?.input == 150 && used?.output == 10 && used?.byModel == ["M": 107] && AntigravityUsage.tokens(in: [:]) == nil)
+            let keep = AntigravityUsage(plan: "Pro", models: [model("Live", 40, 4e9), model("Reset already", 10, 1)])
+            let kept = { () -> Data? in
+                let d = UserDefaults.standard.data(forKey: AntigravityUsage.savedKey); keep.save()
+                defer { UserDefaults.standard.set(d, forKey: AntigravityUsage.savedKey) }   // leave the real one alone
+                return UserDefaults.standard.data(forKey: AntigravityUsage.savedKey)
+            }()
+            let back = AntigravityUsage.saved(kept)
+            precondition(back?.plan == "Pro" && back?.models.map(\.name) == ["Live"] && back?.models.first?.window.remaining == 40)
+            precondition(AntigravityUsage.saved(nil) == nil)
+            precondition(tokenCount(62593) == "62.6k" && tokenCount(950) == "950" && tokenCount(1_200_000) == "1.2M")
             func saved(_ stamp: String) -> PlanUsage? {
                 PlanUsage.savedClaude(Data(#"{"five_hour":null,"seven_day":{"utilization":52.0,"resets_at":"\#(stamp)"}}"#.utf8))
             }
@@ -626,6 +678,12 @@ struct CreoApp: App {
                 if let claudePlan { print("Claude plan: \(claudePlan)") }
                 var claudeUsage: PlanUsage?
                 if case .usage(let usage) = claude { claudeUsage = usage }
+                if let ag = await AntigravityUsage.read() {
+                    if let plan = ag.plan { print("Antigravity plan: \(plan)") }
+                    for model in ag.models {
+                        print("Antigravity \(model.name): \(model.window.remaining)% remaining, resets \(model.window.resetsAt.formatted())")
+                    }
+                } else { print("Antigravity usage unavailable. Open Antigravity to see it.") }
                 for (title, usage) in [("Codex", PlanUsage.readCodex()), ("Claude", claudeUsage)] {
                     guard let usage else { print("\(title) usage unavailable. \(title == "Claude" ? claude.note ?? "" : "")"); continue }
                     if let plan = usage.plan { print("\(title) plan: \(plan)") }

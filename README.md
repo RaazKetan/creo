@@ -34,11 +34,12 @@ version through Homebrew automatically; Creo then reopens itself.
 
 ## Features
 
-- Open ChatGPT, Claude, and Perplexity panels from one menu-bar notch.
-- Track Claude and Codex five-hour and weekly usage at a glance.
+- Open ChatGPT, Claude, and Antigravity panels from one menu-bar notch.
+- Track Claude and Codex five-hour and weekly usage at a glance, and Antigravity's
+  usage per model while Antigravity is open.
 - Search, filter, rename, and resume local Claude Code and Codex sessions.
-- Open Perplexity usage in its account dashboard; Perplexity does not expose local
-  sessions here yet.
+- List and search Antigravity conversations, with the tokens each one used, and open
+  their project in Antigravity.
 - Jump back to an active session instead of opening a duplicate.
 - Start automatically when you log in.
 - Keep session data private on your Mac.

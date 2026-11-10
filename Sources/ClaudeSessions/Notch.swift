@@ -14,6 +14,11 @@ struct UsageWindow {
         resetsAt = Date(timeIntervalSince1970: reset)
     }
 
+    init(remaining: Int, resetsAt: Date) {
+        self.remaining = remaining
+        self.resetsAt = resetsAt
+    }
+
     /// Claude's shape: `{"utilization": 17.0, "resets_at": "2026-10-07T12:59:59.75+00:00"}`.
     init?(claude value: [String: Any]?) {
         guard let value, let used = value["utilization"] as? Double,
@@ -67,14 +72,16 @@ struct PlanUsage {
     }
 
     /// The CLI's internal plan ids, grouped under the names people know. "pro", "prolite" and
-    /// "promax" are all Pro. An id we haven't seen shows no badge rather than a raw one.
+    /// "promax" are all Pro. An id nobody has seen yet still shows, tidied: "pro_plus" reads
+    /// "Pro Plus", so a new plan never needs a release to appear.
     static func codexPlanName(_ type: String?) -> String? {
         guard let type, !type.isEmpty else { return nil }
         if type.hasPrefix("pro") { return "Pro" }
         if type.contains("business") { return "Business" }
         if type.hasPrefix("ent") { return "Enterprise" }
         if type.hasPrefix("edu") { return "Edu" }
-        return ["free", "go", "plus", "team"].contains(type) ? type.capitalized : nil
+        let words = type.replacingOccurrences(of: "_", with: " ").capitalized
+        return words.count <= 16 ? words : nil   // a long internal id is noise, not a name
     }
 
     init?(codex result: [String: Any]) {
@@ -225,12 +232,197 @@ struct PlanUsage {
     }
 }
 
+/// Antigravity's plan and how much of each model is left, from its own local server.
+///
+/// Antigravity runs a small server on this Mac for its agent panel and writes where to find it,
+/// with the access code it expects, to ~/.gemini/antigravity/daemon/hub_<port>.json. Creo asks it
+/// the same questions the panel does. Nothing leaves the Mac, and the code is never stored.
+// ponytail: an internal API that moved apps in the November 2026 update. Any failure reads as
+//           "open Antigravity", which is also the truth whenever it is closed.
+struct AntigravityUsage {
+    struct Model { let name: String; let window: UsageWindow }
+    let plan: String?
+    let models: [Model]
+
+    /// Its server, if it is running: base URL and access code.
+    static func hub() -> (url: String, code: String)? {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/antigravity/daemon")
+        for file in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
+        where file.lastPathComponent.hasPrefix("hub_") {
+            guard let obj = (try? JSONSerialization.jsonObject(with: Data(contentsOf: file))) as? [String: Any],
+                  let port = (obj["httpPort"] as? NSNumber)?.intValue,
+                  let code = obj["csrfToken"] as? String,
+                  let pid = (obj["pid"] as? NSNumber)?.int32Value, kill(pid, 0) == 0   // a file left by a crash
+            else { continue }
+            return ("http://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/", code)
+        }
+        return nil
+    }
+
+    static func call(_ method: String, _ body: [String: Any] = [:]) async -> [String: Any]? {
+        guard let hub = hub(), let url = URL(string: hub.url + method) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        request.setValue(hub.code, forHTTPHeaderField: "X-Codeium-Csrf-Token")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Why there is nothing to show: closed, or open but answering in a way Creo can't read.
+    /// Why there is no fresh reading. Antigravity's agent service comes and goes on its own, even
+    /// with the app open, so "open Antigravity" is only said when the app really is closed.
+    static func note(for usage: AntigravityUsage?) -> String? {
+        guard usage == nil else { return nil }
+        if hub() != nil { return "Couldn't read Antigravity's usage. It may have changed in an update." }
+        let open = NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier?.localizedCaseInsensitiveContains("antigravity") == true
+        }
+        return open ? "Antigravity's agent isn't running right now. Use the agent panel in Antigravity to update usage."
+            : "Open Antigravity to see model usage here."
+    }
+
+    // MARK: The last good reading, kept for when the service is not up.
+    // Only the plan and each model's numbers are stored: the full reply carries the user's name
+    // and email, which have no business sitting in Creo's settings.
+    static let savedKey = "antigravityUsageSaved"
+
+    func save() {
+        let models = self.models.map { ["name": $0.name, "remaining": $0.window.remaining,
+                                        "reset": $0.window.resetsAt.timeIntervalSince1970] as [String: Any] }
+        var saved: [String: Any] = ["models": models]
+        if let plan { saved["plan"] = plan }
+        UserDefaults.standard.set(try? JSONSerialization.data(withJSONObject: saved), forKey: Self.savedKey)
+    }
+
+    /// That reading, minus any model whose quota has reset since, as its number no longer holds.
+    static func saved(_ data: Data?, now: Date = Date()) -> AntigravityUsage? {
+        guard let data, let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        let models = (obj["models"] as? [[String: Any]] ?? []).compactMap { m -> Model? in
+            guard let name = m["name"] as? String, let left = (m["remaining"] as? NSNumber)?.intValue,
+                  let reset = (m["reset"] as? NSNumber)?.doubleValue, reset > now.timeIntervalSince1970 else { return nil }
+            return Model(name: name, window: UsageWindow(remaining: left, resetsAt: Date(timeIntervalSince1970: reset)))
+        }
+        return models.isEmpty ? nil : AntigravityUsage(plan: obj["plan"] as? String, models: models)
+    }
+
+    static func read() async -> AntigravityUsage? {
+        (await call("GetUserStatus")).flatMap { AntigravityUsage(status: $0) }
+    }
+
+    init?(status: [String: Any]) {
+        guard let user = status["userStatus"] as? [String: Any] else { return nil }
+        let tier = (user["userTier"] as? [String: Any])?["name"] as? String
+        let planInfo = ((user["planStatus"] as? [String: Any])?["planInfo"] as? [String: Any])?["planName"] as? String
+        // "Google AI Pro" crowds the header next to an update button; the plan is the last word.
+        plan = (tier.map { $0.replacingOccurrences(of: "Google AI ", with: "") }) ?? planInfo
+        let configs = ((user["cascadeModelConfigData"] as? [String: Any])?["clientModelConfigs"] as? [[String: Any]]) ?? []
+        let iso = ISO8601DateFormatter()
+        models = configs.compactMap { config in
+            // A model with no reset time has no quota to show. The JSON leaves out zero values, so
+            // a used-up model arrives with a reset time and no remainingFraction at all.
+            // The display label, else the model's own id, so a renamed field still shows something.
+            let name = [config["label"], config["modelId"], (config["modelOrAlias"] as? [String: Any])?["model"]]
+                .compactMap { $0 as? String }.first { !$0.isEmpty }
+            guard let name,
+                  let quota = config["quotaInfo"] as? [String: Any],
+                  let reset = (quota["resetTime"] as? String).flatMap(iso.date(from:)) else { return nil }
+            let left = (quota["remainingFraction"] as? NSNumber)?.doubleValue ?? 0
+            return Model(name: name, window: UsageWindow(remaining: max(0, min(100, Int((left * 100).rounded()))),
+                                                         resetsAt: reset))
+        }
+    }
+
+    init(plan: String?, models: [Model]) {
+        self.plan = plan
+        self.models = models
+    }
+
+    /// Models that share a quota read as one: "Gemini 3.8 Flash (High)", "(Medium)" and "(Low)"
+    /// with the same amount left and the same reset are "Gemini 3.8 Flash". A model that is the
+    /// only one of its name drops the suffix too ("Claude Opus 4.6"); variants that differ keep it.
+    var grouped: [Model] {
+        func base(_ name: String) -> String {
+            name.replacingOccurrences(of: #"\s*\([^)]*\)$"#, with: "", options: .regularExpression)
+        }
+        var out: [Model] = []
+        for model in models {
+            if let last = out.last, base(last.name) == base(model.name),
+               last.window.remaining == model.window.remaining, last.window.resetsAt == model.window.resetsAt {
+                out[out.count - 1] = Model(name: base(model.name), window: model.window)
+            } else {
+                out.append(model)
+            }
+        }
+        return out.map { model in
+            out.filter { base($0.name) == base(model.name) }.count == 1
+                ? Model(name: base(model.name), window: model.window) : model
+        }
+    }
+
+    /// The model closest to its limit, which is what the rail's ring shows.
+    var lowest: UsageWindow? { models.map(\.window).min { $0.remaining < $1.remaining } }
+
+    /// Tokens a conversation has used, input and output, added up across every model call.
+    static func tokens(_ id: String) async -> (input: Int, output: Int, byModel: [String: Int])? {
+        guard let reply = await call("GetCascadeTrajectoryGeneratorMetadata", ["cascadeId": id]) else { return nil }
+        return tokens(in: reply)
+    }
+
+    /// Tokens in and out, plus the total per model by the name Antigravity shows for it.
+    static func tokens(in reply: [String: Any]) -> (input: Int, output: Int, byModel: [String: Int])? {
+        // Counts arrive as strings ("62593"), the protobuf JSON form for 64-bit numbers.
+        func number(_ value: Any?) -> Int { (value as? NSNumber)?.intValue ?? (value as? String).flatMap(Int.init) ?? 0 }
+        var input = 0, output = 0, calls = 0
+        var byModel: [String: Int] = [:]
+        for generation in reply["generatorMetadata"] as? [[String: Any]] ?? [] {
+            let chat = generation["chatModel"] as? [String: Any]
+            let model = chat?["modelDisplayName"] as? String
+            for attempt in chat?["retryInfos"] as? [[String: Any]] ?? [] {
+                guard let usage = attempt["usage"] as? [String: Any] else { continue }
+                let (i, o) = (number(usage["inputTokens"]), number(usage["outputTokens"]))
+                input += i
+                output += o
+                calls += 1
+                if let model { byModel[model, default: 0] += i + o }
+            }
+        }
+        return calls == 0 ? nil : (input, output, byModel)
+    }
+
+    /// Most used first: the model with the least left, then the one with the most tokens across
+    /// your conversations, then Antigravity's own order. Nothing here names a model.
+    func ordered(byTokens tokens: [String: Int]) -> [Model] {
+        // A grouped "Gemini 3.8 Flash" collects the tokens of every "Gemini 3.8 Flash (…)".
+        func used(_ name: String) -> Int {
+            tokens.reduce(0) { $0 + ($1.key == name || $1.key.hasPrefix(name + " (") ? $1.value : 0) }
+        }
+        return grouped.enumerated().sorted { a, b in
+            if a.element.window.remaining != b.element.window.remaining {
+                return a.element.window.remaining < b.element.window.remaining
+            }
+            let (ua, ub) = (used(a.element.name), used(b.element.name))
+            return ua != ub ? ua > ub : a.offset < b.offset
+        }.map(\.element)
+    }
+}
+
 @MainActor
 final class NotchState: ObservableObject {
     @Published var usage: [Service: PlanUsage] = [:]
     @Published var claudeNote: String? = "Reading usage…"
     /// From the stored sign-in, so it stays known while the usage request is failing.
     @Published var claudePlan: String?
+    @Published var antigravity: AntigravityUsage?
+    @Published var antigravityNote: String? = "Open Antigravity to see model usage here."
+    /// "62.6k in · 2.0k out" per Antigravity conversation, read while its server is up.
+    @Published var antigravityTokens: [String: String] = [:]
+    /// Tokens per model across the conversations read so far, to put the most used first.
+    @Published var antigravityModelTokens: [String: Int] = [:]
     @Published var updateVersion: String?
     @Published var isUpdating = false
     @Published var updateFailure: String?
@@ -245,7 +437,7 @@ final class NotchState: ObservableObject {
 }
 
 enum Service: String, CaseIterable {
-    case chatgpt, claude, perplexity
+    case chatgpt, claude, antigravity
 
     /// Services whose plan usage Creo can read locally.
     static let tracked: [Service] = [.chatgpt, .claude]
@@ -254,7 +446,7 @@ enum Service: String, CaseIterable {
         switch self {
         case .chatgpt: "ChatGPT"
         case .claude: "Claude"
-        case .perplexity: "Perplexity"
+        case .antigravity: "Antigravity"
         }
     }
 
@@ -267,9 +459,15 @@ enum Service: String, CaseIterable {
         switch self {
         case .chatgpt: .codex
         case .claude: .claude
-        case .perplexity: nil
+        case .antigravity: .antigravity
         }
     }
+}
+
+/// 62593 reads "62.6k", 1200000 reads "1.2M".
+func tokenCount(_ n: Int) -> String {
+    n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1_000_000)
+        : n >= 1_000 ? String(format: "%.1fk", Double(n) / 1_000) : "\(n)"
 }
 
 private struct UsageBar: View {
@@ -299,6 +497,71 @@ private struct UsageBar: View {
             .animation(.easeOut(duration: 0.32), value: window.remaining)
             .accessibilityLabel("\(title), \(window.remaining) percent remaining")
         }
+    }
+}
+
+extension View {
+    /// A horizontal scroll view that opens at its first item.
+    // ponytail: macOS 14's defaultScrollAnchor; on 13 it opens wherever AppKit puts it.
+    @ViewBuilder func startingAtLeadingEdge() -> some View {
+        if #available(macOS 14.0, *) { defaultScrollAnchor(.leading) } else { self }
+    }
+}
+
+/// One Antigravity model: a ring of what is left, the number inside, its name below.
+/// Hover for the reset time.
+private struct ModelRing: View {
+    let model: AntigravityUsage.Model
+    /// Whether any model in the row has a variant line, so every cell keeps the same height.
+    let showsVariant: Bool
+
+    static let ring: CGFloat = 26
+    /// Four across the 316-point row, with the gaps between them.
+    static let width: CGFloat = 76
+    /// Ring, name, and the variant line when there is one.
+    static func height(showsVariant: Bool) -> CGFloat { 2 + ring + 2 + 12 + (showsVariant ? 10 : 0) }
+
+    /// "Gemini 3.8 Flash (High)" splits into "Gemini 3.8 Flash" and "High".
+    static func parts(_ name: String) -> (base: String, variant: String?) {
+        guard let open = name.range(of: " (", options: .backwards), name.hasSuffix(")") else { return (name, nil) }
+        return (String(name[..<open.lowerBound]), String(name[open.upperBound...].dropLast()))
+    }
+
+    var body: some View {
+        let parts = Self.parts(model.name)
+        VStack(spacing: 0) {
+            // Inset by half the line so the stroke stays inside the ring's box; a stroke on the edge
+            // pokes out, and the scroll area clipped the top of every ring flat.
+            ZStack {
+                Circle().inset(by: 1.5).stroke(Color.primary.opacity(0.13), lineWidth: 3)
+                Circle().inset(by: 1.5).trim(from: 0, to: CGFloat(model.window.remaining) / 100)
+                    .stroke(model.window.tint, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeOut(duration: 0.32), value: model.window.remaining)
+                Text("\(model.window.remaining)").font(.system(size: 9, weight: .semibold))
+            }
+            .frame(width: Self.ring, height: Self.ring)
+            .padding(.top, 2)
+            .padding(.bottom, 2)
+            Text(parts.base)
+                .font(.system(size: 9))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .foregroundStyle(Color.primary.opacity(0.7))
+                .frame(height: 12)
+            if showsVariant {
+                Text(parts.variant ?? " ")
+                    .font(.system(size: 8))
+                    .lineLimit(1)
+                    .foregroundStyle(Color.primary.opacity(0.45))
+                    .frame(height: 10)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .help("\(model.name): \(model.window.remaining)% left, resets "
+              + model.window.resetsAt.formatted(.dateTime.month(.abbreviated).day().hour().minute()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(model.name), \(model.window.remaining) percent remaining")
     }
 }
 
@@ -370,8 +633,7 @@ private struct NotchView: View {
     }
 
     private var visibleSessions: [Session] {
-        guard state.selectedService != .perplexity else { return [] }
-        return sessions.filter { session in
+        sessions.filter { session in
             guard sessionFilter == nil || session.agent == sessionFilter else { return false }
             guard !activeOnly || session.isActive else { return false }
             guard !query.isEmpty else { return true }
@@ -386,7 +648,10 @@ private struct NotchView: View {
     }
 
     private func usageHint(_ service: Service) -> String {
-        guard Service.tracked.contains(service) else { return "\(service.title) usage opens in your account" }
+        if service == .antigravity {
+            guard let lowest = state.antigravity?.lowest else { return "Open Antigravity to see usage" }
+            return "\(lowest.remaining)% left on the model closest to its limit"
+        }
         let windows: [String] = [
             state.usage[service]?.fiveHour.map { "\($0.remaining)% 5h remaining" },
             state.usage[service]?.weekly.map { "\($0.remaining)% weekly remaining" },
@@ -435,6 +700,14 @@ private struct NotchView: View {
             loading = true
             sessions = await Task.detached(priority: .userInitiated) { loadSessions() }.value
             loading = false
+            // Only Antigravity's server knows what each conversation used, so ask it per row.
+            var perModel: [String: Int] = [:]
+            for session in sessions.filter({ $0.agent == .antigravity }).prefix(20) {
+                guard let used = await AntigravityUsage.tokens(session.sessionID) else { continue }
+                state.antigravityTokens[session.sessionID] = "\(tokenCount(used.input)) in · \(tokenCount(used.output)) out"
+                perModel.merge(used.byModel, uniquingKeysWith: +)
+            }
+            if !perModel.isEmpty { state.antigravityModelTokens = perModel }
         }
         .onChange(of: state.selectedService) { service in
             sessionFilter = service?.agent
@@ -452,12 +725,12 @@ private struct NotchView: View {
                     .frame(width: 16, height: 16)
                 Text(selected.title)
                     .font(.system(size: 13, weight: .semibold))
-                if let plan = selected == .claude ? state.claudePlan : state.usage[selected]?.plan {
+                if let plan = selected == .claude ? state.claudePlan
+                    : selected == .antigravity ? state.antigravity?.plan : state.usage[selected]?.plan {
                     Text(plan)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(Color.primary.opacity(0.6))
                         .lineLimit(1)
-                        .fixedSize()
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Color.primary.opacity(0.1), in: Capsule())
@@ -480,6 +753,7 @@ private struct NotchView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(state.isUpdating)
+                    .layoutPriority(1)   // the plan badge gives way first when the header is tight
                     .help(state.updateFailure ?? "Install the update automatically and reopen Creo")
                 }
                 Button(action: close) {
@@ -530,22 +804,19 @@ private struct NotchView: View {
             .padding(.horizontal, 12)
             .padding(.top, 6)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Text(searching ? "Searching…" : "\(visibleSessions.count) sessions")
-                    .frame(minWidth: 58, alignment: .leading)
-                if selected != .perplexity {
-                    filterButton("All", agent: nil)
-                    filterButton("ChatGPT", agent: .codex)
-                    filterButton("Claude", agent: .claude)
-                }
+                    .frame(minWidth: 52, alignment: .leading)
+                filterButton("All", agent: nil)
+                filterButton("ChatGPT", agent: .codex)
+                filterButton("Claude", agent: .claude)
+                filterButton("Antigravity", agent: .antigravity)
                 Spacer(minLength: 0)
-                if selected != .perplexity {
-                    Button { activeOnly.toggle() } label: {
-                        Label("Active", systemImage: activeOnly ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle(activeOnly ? Color.green : Color.primary.opacity(0.6))
-                    }
-                    .buttonStyle(.plain)
+                Button { activeOnly.toggle() } label: {
+                    Label("Active", systemImage: activeOnly ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(activeOnly ? Color.green : Color.primary.opacity(0.6))
                 }
+                .buttonStyle(.plain)
             }
             .font(.system(size: 10))
             .foregroundStyle(Color.primary.opacity(0.6))
@@ -642,6 +913,10 @@ private struct NotchView: View {
                 )
                 if let usage = state.usage[service] {
                     usageRings(usage)
+                } else if service == .antigravity, let lowest = state.antigravity?.lowest {
+                    Circle().trim(from: 0, to: CGFloat(lowest.remaining) / 100)
+                        .stroke(lowest.tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
                 }
                 Image(nsImage: service.mark)
                     .resizable()
@@ -664,7 +939,8 @@ private struct NotchView: View {
 
     /// Why the numbers on screen may be old: Claude's last read failed but an earlier one worked.
     private func staleNote(_ service: Service) -> String? {
-        service == .claude && state.usage[.claude] != nil ? state.claudeNote : nil
+        if service == .antigravity { return state.antigravity != nil ? state.antigravityNote : nil }
+        return service == .claude && state.usage[.claude] != nil ? state.claudeNote : nil
     }
 
     @ViewBuilder
@@ -686,14 +962,20 @@ private struct NotchView: View {
 
     @ViewBuilder
     private func usageSection(for selected: Service) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: selected == .antigravity ? 5 : 9) {
             HStack {
                 // Numbers kept from an earlier read stay on screen, so say so without adding a row.
                 Text(staleNote(selected) == nil ? "Usage remaining" : "Usage may be out of date")
                     .help(staleNote(selected) ?? "")
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
-                if Service.tracked.contains(selected) {
+                // Antigravity's models reset together, so say when once instead of on every bar.
+                if selected == .antigravity, let reset = state.antigravity?.models.map(\.window.resetsAt).min() {
+                    Text("Resets \(reset.formatted(.dateTime.month(.abbreviated).day().hour().minute()))")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.primary.opacity(0.55))
+                }
+                if Service.tracked.contains(selected) || selected == .antigravity {
                     Button {
                         NotchController.shared.refreshUsage(ignoringPause: true)   // an explicit ask
                     } label: { Image(systemName: "arrow.clockwise") }
@@ -701,6 +983,7 @@ private struct NotchView: View {
                         .help("Refresh usage")
                 }
             }
+            .padding(.bottom, selected == .antigravity ? 7 : 0)   // room between the title and the rings
             if Service.tracked.contains(selected) {
                 if let window = state.usage[selected]?.fiveHour { UsageBar(title: "5h", window: window) }
                 if let window = state.usage[selected]?.weekly { UsageBar(title: "Weekly", window: window) }
@@ -713,14 +996,28 @@ private struct NotchView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(Color.primary.opacity(0.6))
                 }
+            } else if let models = state.antigravity?.ordered(byTokens: state.antigravityModelTokens), !models.isEmpty {
+                // One row, most used first, scrolling sideways past four. Four or fewer share the row;
+                // with more, each is a little narrower so the fifth peeks in, showing there is more.
+                // The area gets an exact height: left to work it out, it came out too short.
+                let variants = models.contains { ModelRing.parts($0.name).variant != nil }
+                // Start at the front, where the most used are. Not ScrollViewReader.scrollTo: calling
+                // it as the panel switched to Antigravity left the whole flyout blank (39 of 40 tries).
+                ScrollView(.horizontal) {
+                    HStack(alignment: .top, spacing: 4) {
+                        ForEach(models, id: \.name) {
+                            ModelRing(model: $0, showsVariant: variants)
+                                .frame(width: models.count > 4 ? ModelRing.width - 8 : ModelRing.width)
+                        }
+                    }
+                }
+                .startingAtLeadingEdge()
+                .frame(height: ModelRing.height(showsVariant: variants))
+                .scrollIndicators(models.count > 4 ? .visible : .hidden)
             } else {
-                Text("Perplexity usage is available in your account.")
+                Text(state.antigravityNote ?? "Open Antigravity to see model usage here.")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.primary.opacity(0.6))
-                Link("Open \(selected.title) usage ↗", destination:
-                        URL(string: "https://www.perplexity.ai/settings/account")!)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.green)
             }
         }
         .foregroundStyle(.primary)
@@ -732,7 +1029,6 @@ private struct NotchView: View {
             Image(systemName: "text.magnifyingglass")
                 .font(.system(size: 20))
             Text(loading ? "Loading sessions…" :
-                 state.selectedService == .perplexity ? "No local Perplexity sessions" :
                  query.isEmpty ? "No sessions here" : "No matching sessions")
                 .font(.system(size: 12, weight: .medium))
         }
@@ -768,11 +1064,17 @@ private struct NotchView: View {
                         .font(.system(size: 10))
                         .foregroundStyle(Color.primary.opacity(0.48))
                 }
-                Text(session.shortPath)
-                    .font(.system(size: 10))
-                    .foregroundStyle(Color.primary.opacity(0.53))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 6) {
+                    Text(session.shortPath)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    if let tokens = state.antigravityTokens[session.sessionID] {
+                        Text(tokens).help("Tokens this conversation has used")
+                    }
+                }
+                .font(.system(size: 10))
+                .foregroundStyle(Color.primary.opacity(0.53))
                 if let passage = matches[session.sessionID], !query.isEmpty {
                     Text(passage)
                         .font(.system(size: 10))
@@ -793,8 +1095,11 @@ private struct NotchView: View {
             Button("Rename…") {
                 if promptToRename(session) { state.refreshToken += 1 }
             }
-            Button("Move to Trash…", role: .destructive) {
-                if confirmAndTrash(session) { state.refreshToken += 1 }
+            // Antigravity keeps its own record of a conversation; trashing one file leaves it listed.
+            if session.agent != .antigravity {
+                Button("Move to Trash…", role: .destructive) {
+                    if confirmAndTrash(session) { state.refreshToken += 1 }
+                }
             }
             Button("Copy session id") {
                 NSPasteboard.general.clearContents()
@@ -868,7 +1173,8 @@ final class NotchController {
         state.refreshToken += 1
         // ponytail: read on open, not on a timer, because Claude's endpoint rate limits. The floor
         //           only stops quick re-clicks from spending requests; ↻ always reads.
-        if Date().timeIntervalSince(lastUsageRefresh) > 30 { refreshUsage() }
+        // Missing or old numbers are worth another try straight away; otherwise once per 30 seconds.
+        if Date().timeIntervalSince(lastUsageRefresh) > 30 || state.antigravityNote != nil { refreshUsage() }
         // Ask again on every open (cached for a minute), so a release published while the app
         // was running shows up now instead of at the next two-hour check.
         Task { if let newer = await Update.newerVersion() { showUpdate(newer) } }
@@ -1008,6 +1314,11 @@ final class NotchController {
                 try? await Task.sleep(for: .milliseconds(90))
                 guard let self, self.animationID == currentAnimation else { return }
                 self.state.selectedService = service
+                // A second click inside the first one's opening cancels it before the flyout has
+                // grown, which left a wide panel with its outline still folded. Grow it here too.
+                if self.state.expansion < 1 {
+                    withAnimation(.spring(response: 0.32, dampingFraction: 0.88)) { self.state.expansion = 1 }
+                }
                 withAnimation(.easeOut(duration: 0.18)) { self.state.detailVisible = true }
             }
         }
@@ -1015,13 +1326,30 @@ final class NotchController {
 
     func refreshUsage(ignoringPause: Bool = false) {
         lastUsageRefresh = Date()
+        // Each service shows as soon as its own answer is in. Waiting for all three let a
+        // rate-limited Claude, retrying for twenty seconds, hold back the other two.
         Task.detached(priority: .utility) {
-            async let codex = PlanUsage.readCodex()
-            async let claude = PlanUsage.readClaude(ignoringPause: ignoringPause)
-            let (codexUsage, (claudeRead, claudePlan)) = await (codex, claude)
+            let fresh = await AntigravityUsage.read()
+            fresh?.save()
+            let note = AntigravityUsage.note(for: fresh)
+            // No fresh reading: show the last one under "may be out of date", or the note alone.
+            let shown = fresh ?? AntigravityUsage.saved(UserDefaults.standard.data(forKey: AntigravityUsage.savedKey))
+            await MainActor.run {
+                self.state.antigravity = shown
+                self.state.antigravityNote = note
+            }
+        }
+        Task.detached(priority: .utility) {
+            let codex = PlanUsage.readCodex()
             await MainActor.run {
                 // A failed read keeps the last good value instead of blanking the ring.
-                if let codexUsage { self.state.usage[.chatgpt] = codexUsage }
+                if let codex { self.state.usage[.chatgpt] = codex }
+                self.updateStatusIcon()
+            }
+        }
+        Task.detached(priority: .utility) {
+            let (claudeRead, claudePlan) = await PlanUsage.readClaude(ignoringPause: ignoringPause)
+            await MainActor.run {
                 switch claudeRead {
                 case .usage(let usage): self.state.usage[.claude] = usage
                 case .signedOut:   // those numbers aren't yours now

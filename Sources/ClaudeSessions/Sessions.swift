@@ -5,19 +5,31 @@ import Foundation
 /// The coding agent a session belongs to. Each stores its transcripts differently and has
 /// its own resume command, but a row is a row.
 enum Agent: String, CaseIterable {
-    case claude, codex
+    case claude, codex, antigravity
 
-    var label: String { self == .claude ? "Claude" : "Codex" }
-    var binary: String { rawValue }
+    var label: String {
+        switch self {
+        case .claude: "Claude"
+        case .codex: "Codex"
+        case .antigravity: "Antigravity"
+        }
+    }
+    var binary: String { self == .antigravity ? "agy" : rawValue }
     var installURL: String {
-        self == .claude ? "https://claude.com/claude-code" : "https://developers.openai.com/codex/cli"
+        switch self {
+        case .claude: "https://claude.com/claude-code"
+        case .codex: "https://developers.openai.com/codex/cli"
+        case .antigravity: "https://antigravity.google"
+        }
     }
 
-    /// Resume command, minus the working directory.
+    /// Resume command, minus the working directory. Antigravity conversations open their folder
+    /// in the IDE instead (see `resume`), so this is only what its CLI would take.
     func resumeCommand(_ id: String, skipPermissions: Bool) -> String {
         switch self {
         case .claude: return "claude --resume \(id)" + (skipPermissions ? " --dangerously-skip-permissions" : "")
         case .codex:  return "codex resume \(id)" + (skipPermissions ? " --ask-for-approval never" : "")
+        case .antigravity: return "agy --conversation \(id)"
         }
     }
 }
@@ -152,13 +164,13 @@ func sessionsContaining(_ text: String) -> [String: String] {
         find \(roots) -name '*.jsonl' -print0 2>/dev/null \
           | xargs -0 -P 12 -n 1 /bin/sh -c 'grep -boFim 1 -H -e "$0" "$1" 2>/dev/null | head -1' \(quoted)
         """
-    guard let out = sh(command), !out.isEmpty else { return [:] }
+    var found = antigravityConversationsContaining(text)
+    guard let out = sh(command), !out.isEmpty else { return found }
 
     // A hit is either <folder>/<session-id>.jsonl or, for a subagent transcript,
     // <folder>/<session-id>/subagents/agent-*.jsonl — and a Codex rollout can belong to a
     // subagent thread. Either way the row you can open is the conversation that spawned it.
     let parents = codexThreads().parents
-    var found: [String: String] = [:]
     for line in out.split(separator: "\n") {
         // "<path>:<byte offset>:<match>" — split on the extension, paths can hold colons.
         let row = String(line)
@@ -479,9 +491,87 @@ func loadCodexSessions() -> [Session] {
     return out
 }
 
+/// Antigravity's own record of its conversations: one SQLite file with a summary row each,
+/// and a full-text index of what was said.
+private let antigravityDB = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".gemini/antigravity/conversation_summaries.db").path
+
+/// Rows from that file. Antigravity holds it open, so read it immutable rather than read-only:
+/// read-only still wants to create the lock files beside it and gives up.
+// ponytail: an undocumented file that changed shape in the November 2026 update. A query that
+//           stops matching returns nothing, so the tab goes empty instead of breaking the app.
+private func antigravityQuery(_ sql: String) -> [[String: Any]] {
+    guard FileManager.default.fileExists(atPath: antigravityDB) else { return [] }
+    let uri = "'file:" + antigravityDB.replacingOccurrences(of: "'", with: "'\\''") + "?immutable=1'"
+    let quoted = "'" + sql.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    let out = sh("sqlite3 -json \(uri) \(quoted) 2>/dev/null") ?? ""
+    return (try? JSONSerialization.jsonObject(with: Data(out.utf8)) as? [[String: Any]]) ?? []
+}
+
+/// Antigravity conversations, one row per top-level conversation (subagents are folded in).
+// ponytail: `select *` and every field read with a fallback, as with Codex's database. A column
+//           that is renamed or dropped costs that detail, not the whole list.
+func loadAntigravitySessions() -> [Session] {
+    let names = Names.load()
+    let stamp = DateFormatter()
+    stamp.locale = Locale(identifier: "en_US_POSIX")
+    stamp.dateFormat = "yyyy-MM-dd HH:mm:ss.SSSSSSZZZZZ"
+    let iso = ISO8601DateFormatter()
+    func date(_ value: Any?) -> Date? {
+        guard let raw = value as? String, !raw.isEmpty else { return nil }
+        // Fractional seconds vary in length, so pad or trim them to the six the format wants.
+        let parts = raw.split(separator: ".", maxSplits: 1)
+        if parts.count == 2, let zone = parts[1].firstIndex(where: { $0 == "+" || $0 == "-" }) {
+            let digits = String(parts[1][..<zone]).padding(toLength: 6, withPad: "0", startingAt: 0)
+            if let d = stamp.date(from: "\(parts[0]).\(digits)\(parts[1][zone...])") { return d }
+        }
+        return stamp.date(from: raw) ?? iso.date(from: raw)
+    }
+    let folder = (antigravityDB as NSString).deletingLastPathComponent + "/conversations/"
+
+    return antigravityQuery("select * from conversation_summaries").compactMap { row -> Session? in
+        guard let id = row["conversation_id"] as? String ?? row["id"] as? String else { return nil }
+        if let depth = row["nesting_depth"] as? NSNumber, depth.intValue > 0 { return nil }   // a subagent
+        // "Fixing Java Method Error" sits in preview; title is empty until it is renamed.
+        let title = [row["title"], row["preview"]].compactMap { ($0 as? String).flatMap(usableTitle) }.first
+        let uris = (row["workspace_uris"] as? String).flatMap {
+            try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String]
+        } ?? []
+        let cwd = uris.first.flatMap(URL.init(string:))?.path ?? ""
+        let transcript = folder + id + ".db"
+        let modified = date(row["last_modified_time"]) ?? date(row["last_user_input_time"])
+            ?? (try? FileManager.default.attributesOfItem(atPath: transcript)[.modificationDate] as? Date)
+            ?? .distantPast
+        var session = Session(id: transcript, sessionID: id, agent: .antigravity, cwd: cwd,
+                              title: title ?? "(untitled)", name: names[id],
+                              created: modified, modified: modified,
+                              exists: !cwd.isEmpty && FileManager.default.fileExists(atPath: cwd))
+        // ponytail: only "idle" has been seen. Anything naming a run in progress counts as live.
+        session.isRunning = (row["status"] as? String)?.contains("RUNNING") == true
+        return session
+    }
+}
+
+/// Antigravity conversations mentioning `text`, from its own full-text index.
+private func antigravityConversationsContaining(_ text: String) -> [String: String] {
+    // A phrase in double quotes, with any quote inside doubled, so FTS reads it as plain text.
+    let phrase = "\"" + text.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+    let sql = """
+        select conversation_id, snippet(conversations_fts, -1, '', '', '…', 12) as passage
+        from conversations_fts where conversations_fts match '\(phrase.replacingOccurrences(of: "'", with: "''"))'
+        """
+    var found: [String: String] = [:]
+    for row in antigravityQuery(sql) {
+        if let id = row["conversation_id"] as? String, found[id] == nil {
+            found[id] = readable(row["passage"] as? String ?? "")
+        }
+    }
+    return found
+}
+
 /// Every session from every agent, newest first.
 func loadSessions() -> [Session] {
-    var out = loadClaudeSessions() + loadCodexSessions()
+    var out = loadClaudeSessions() + loadCodexSessions() + loadAntigravitySessions()
 
     // Both passes are cross-agent: a folder holding one Claude session and three Codex ones is
     // not a folder where a cwd match identifies anything.
@@ -490,7 +580,7 @@ func loadSessions() -> [Session] {
     let running = runningSessions()
     for i in out.indices {
         out[i].aloneInFolder = perFolder[out[i].cwd] == 1
-        out[i].isRunning = running[out[i].sessionID] != nil
+        out[i].isRunning = out[i].isRunning || running[out[i].sessionID] != nil
     }
     return out.sorted { $0.modified > $1.modified }
 }
